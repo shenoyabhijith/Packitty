@@ -713,7 +713,6 @@ def execute_mitigation(alert):
         actual_command = recommendation.get('ufw_command', f'sudo ufw {action.lower().replace("_", " ")} from {source_ip}')
         ufw_command = f"{actual_command} (EXECUTED via AI tool calling)"
         if action != 'MONITOR':
-            blocked_ips.add(source_ip)
             status = 'MITIGATED'
         else:
             status = 'MONITORING'
@@ -730,7 +729,6 @@ def execute_mitigation(alert):
             else:
                 ufw_command = f"{ufw_command} (EXECUTED)"
             if ufw_result.get('success'):
-                blocked_ips.add(source_ip)
                 status = 'MITIGATED'
             else:
                 status = 'FAILED'
@@ -743,7 +741,6 @@ def execute_mitigation(alert):
             else:
                 ufw_command = f"{ufw_command} (EXECUTED)"
             if ufw_result.get('success'):
-                blocked_ips.add(source_ip)
                 status = 'MITIGATED'
             else:
                 status = 'FAILED'
