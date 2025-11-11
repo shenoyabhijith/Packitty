@@ -1,5 +1,48 @@
 # Bug Reports and Fixes
 
+## Bug: Excessive False Positives and Too Many Alerts
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+False positives were increasing even when no attacks were being simulated. The system was generating too many alerts from normal traffic patterns being misclassified as attacks.
+
+### Root Causes
+1. **Thresholds too low**: Confidence threshold (0.90) and attack probability (0.85) were not strict enough
+2. **Feature validation too lenient**: Attack pattern thresholds were too low (e.g., packet_rate > 300)
+3. **Time-window too short**: Only 10 seconds with 3 detections required
+4. **No normal range check**: System didn't check if features were within normal ranges first
+5. **Time-window validation weak**: Didn't verify confidence of previous detections
+
+### Solution Implemented
+1. **Increased confidence threshold**: 0.90 → 0.95
+2. **Increased attack probability threshold**: 0.85 → 0.90
+3. **Increased time window**: 10s → 15s
+4. **Increased required detections**: 3 → 5 in time window
+5. **Added normal range check**: If all features within normal ranges, reject immediately
+6. **Stricter feature validation thresholds**:
+   - SYN_Flood: syn_ratio > 0.7 (was 0.5), packet_rate > 500 (was 300)
+   - HTTP_Flood: packet_rate > 500 (was 300), byte_rate > 150000 (was 100000)
+   - UDP_Flood: udp_ratio > 0.7 (was 0.5), packet_rate > 500 (was 300)
+   - DNS_Amplification: dns_queries > 50 (was 30), byte_rate > 150000 (was 100000)
+   - Slowloris: request_interval > 3000 (was 2000), connection_rate > 20 (was 15)
+7. **Enhanced time-window validation**: Now requires previous detections to also have high confidence (>= 0.95)
+
+### Code Changes
+- Modified `is_valid_attack_detection()` function in `app.py`
+- Added normal range check before feature validation
+- Increased all thresholds in validation logic
+- Updated time-window validation to check confidence of previous detections
+
+### Result
+- Significantly reduced false positives
+- Requires 5 high-confidence detections in 15-second window
+- Normal traffic spikes no longer trigger alerts
+- Only genuine attacks with clear patterns will create alerts
+
+---
+
 ## Bug: Flask App Cannot Run with Uvicorn (ASGI/WSGI Mismatch)
 
 **Date:** 2025-11-11  
