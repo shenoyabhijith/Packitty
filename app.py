@@ -795,8 +795,12 @@ def calculate_statistics():
     cursor.execute('SELECT COUNT(*) FROM mitigation_history WHERE ai_powered = 1')
     ai_mitigations = cursor.fetchone()[0]
     
-    # Calculate attack distribution from database
-    cursor.execute('SELECT attack_type, COUNT(*) as count FROM alerts GROUP BY attack_type')
+    # Calculate attack distribution from database (only actual attacks, exclude Normal)
+    cursor.execute('''
+        SELECT attack_type, COUNT(*) as count FROM alerts 
+        WHERE attack_type != 'Normal'
+        GROUP BY attack_type
+    ''')
     attack_dist = {row[0]: row[1] for row in cursor.fetchall()}
     
     # Count total mitigations
@@ -1361,16 +1365,15 @@ dashboard_template = '''
             }
         });
         
-        // Initialize attack distribution chart
+        // Initialize attack distribution chart (only shows actual attacks)
         const attackCtx = document.getElementById('attackChart').getContext('2d');
         const attackChart = new Chart(attackCtx, {
             type: 'doughnut',
             data: {
-                labels: ['Normal', 'SYN Flood', 'HTTP Flood', 'UDP Flood', 'Slowloris', 'DNS Amplification'],
+                labels: ['SYN Flood', 'HTTP Flood', 'UDP Flood', 'Slowloris', 'DNS Amplification'],
                 datasets: [{
-                    data: [0, 0, 0, 0, 0, 0],
+                    data: [0, 0, 0, 0, 0],
                     backgroundColor: [
-                        chartColors.success,
                         chartColors.danger,
                         chartColors.danger,
                         chartColors.warning,
@@ -1391,6 +1394,12 @@ dashboard_template = '''
                 }
             }
         });
+        
+        // Initially hide the chart container (will show when attacks are detected)
+        const chartContainer = document.querySelector('.chart-container');
+        if (chartContainer) {
+            chartContainer.style.display = 'none';
+        }
         
         // Update dashboard data
         function updateDashboard() {
@@ -1517,21 +1526,35 @@ dashboard_template = '''
                 })
                 .catch(error => console.error('Error fetching traffic:', error));
             
-            // Update attack distribution
+            // Update attack distribution (only show when there are actual attacks)
             fetch('/api/attack-distribution')
                 .then(response => response.json())
                 .then(data => {
-                    const attackCounts = [
-                        data['Normal'] || 0,
-                        data['SYN_Flood'] || 0,
-                        data['HTTP_Flood'] || 0,
-                        data['UDP_Flood'] || 0,
-                        data['Slowloris'] || 0,
-                        data['DNS_Amplification'] || 0
-                    ];
+                    // Filter out Normal and check if there are any actual attacks
+                    const attackTypes = ['SYN_Flood', 'HTTP_Flood', 'UDP_Flood', 'Slowloris', 'DNS_Amplification'];
+                    const attackCounts = attackTypes.map(type => data[type] || 0);
+                    const totalAttacks = attackCounts.reduce((sum, count) => sum + count, 0);
                     
-                    attackChart.data.datasets[0].data = attackCounts;
-                    attackChart.update();
+                    const chartContainer = document.querySelector('.chart-container');
+                    const attackChartCanvas = document.getElementById('attackChart');
+                    
+                    // Only show chart if there are actual attacks
+                    if (totalAttacks > 0) {
+                        // Show chart container
+                        if (chartContainer) {
+                            chartContainer.style.display = 'block';
+                        }
+                        
+                        // Update chart with only attack types (no Normal)
+                        attackChart.data.labels = attackTypes;
+                        attackChart.data.datasets[0].data = attackCounts;
+                        attackChart.update();
+                    } else {
+                        // Hide chart container when no attacks
+                        if (chartContainer) {
+                            chartContainer.style.display = 'none';
+                        }
+                    }
                 })
                 .catch(error => console.error('Error fetching attack distribution:', error));
             
