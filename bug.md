@@ -338,3 +338,49 @@ Modified false positive logging to only log when the attack type appears in rece
 - Verified logs are cleaner when no alerts are present
 - Verified function correctly checks database for recent alerts
 
+---
+
+## Bug: Excessive Werkzeug 400 Bad Request Error Logs
+
+**Date:** 2024-12-19  
+**Status:** FIXED
+
+### Problem
+The application logs were being flooded with werkzeug ERROR messages for 400 Bad Request errors from scanners and bots attempting to probe the server. These malformed requests (often TLS handshake attempts on HTTP port) were creating thousands of log entries like:
+```
+ERROR:werkzeug:104.28.50.130 - - [11/Nov/2025 20:47:05] code 400, message Bad request version ('...')
+```
+
+This made it difficult to see actual application logs and important errors.
+
+### Root Cause
+Werkzeug was logging all 400 Bad Request errors at ERROR level, including:
+- Malformed HTTP requests from scanners
+- TLS handshake attempts on HTTP port
+- Bot probes and automated attacks
+- Invalid request syntax
+
+These are common on public-facing servers and don't represent actual application errors.
+
+### Solution Implemented
+1. **Custom logging filter**: Created `SuppressBadRequestFilter` class to filter out werkzeug 400 errors
+2. **Error handler**: Added Flask error handler for 400 errors to handle them silently
+3. **Logger level**: Set werkzeug logger to ERROR level to reduce verbosity
+
+### Code Changes
+- Added `SuppressBadRequestFilter` class in `app.py` (lines 24-30)
+- Applied filter to werkzeug logger (lines 33-35)
+- Added Flask 400 error handler (lines 69-72)
+- Changed werkzeug log level from WARNING to ERROR
+
+### Result
+- 400 Bad Request errors from scanners/bots are no longer logged
+- Logs are much cleaner and easier to read
+- Actual application errors are still logged
+- Server still responds with 400 status code (just doesn't log it)
+
+### Testing
+- Verified 400 errors are suppressed in logs
+- Verified legitimate errors are still logged
+- Verified server still returns 400 status codes correctly
+
