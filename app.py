@@ -1400,7 +1400,8 @@ dashboard_template = '''
                         return;
                     }
                     
-                    decisionsList.innerHTML = aiDecisions.slice().reverse().map(decision => {
+                    // Data is already sorted DESC from API, just take latest 5 AI decisions
+                    decisionsList.innerHTML = aiDecisions.slice(0, 5).map(decision => {
                         const time = new Date(decision.timestamp * 1000).toLocaleString();
                         const actionColor = decision.action === 'BLOCK' ? '#ef4444' : 
                                           decision.action === 'RATE_LIMIT' ? '#f59e0b' : '#10b981';
@@ -1629,11 +1630,11 @@ def get_alerts():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Get all alerts ordered by timestamp (most recent first)
+    # Get latest 5 alerts ordered by timestamp (most recent first)
     cursor.execute('''
         SELECT * FROM alerts 
         ORDER BY timestamp DESC 
-        LIMIT 100
+        LIMIT 5
     ''')
     
     alerts_list = []
@@ -1667,11 +1668,11 @@ def get_mitigation_history():
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
     
-    # Get all mitigation records ordered by timestamp (most recent first)
+    # Get latest 5 mitigation records ordered by timestamp (most recent first)
     cursor.execute('''
         SELECT * FROM mitigation_history 
         ORDER BY timestamp DESC 
-        LIMIT 50
+        LIMIT 5
     ''')
     
     mitigation_list = []
