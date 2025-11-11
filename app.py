@@ -1395,8 +1395,9 @@ dashboard_template = '''
             }
         });
         
-        // Initially hide the chart container (will show when attacks are detected)
-        const chartContainer = document.querySelector('.chart-container');
+        // Initially hide the attack distribution chart container (will show when attacks are detected)
+        const attackChartCanvas = document.getElementById('attackChart');
+        const chartContainer = attackChartCanvas ? attackChartCanvas.closest('.chart-container') : null;
         if (chartContainer) {
             chartContainer.style.display = 'none';
         }
@@ -1535,8 +1536,9 @@ dashboard_template = '''
                     const attackCounts = attackTypes.map(type => data[type] || 0);
                     const totalAttacks = attackCounts.reduce((sum, count) => sum + count, 0);
                     
-                    const chartContainer = document.querySelector('.chart-container');
+                    // Find the attack distribution chart container (parent of attackChart)
                     const attackChartCanvas = document.getElementById('attackChart');
+                    const chartContainer = attackChartCanvas ? attackChartCanvas.closest('.chart-container') : null;
                     
                     // Only show chart if there are actual attacks
                     if (totalAttacks > 0) {
