@@ -452,14 +452,32 @@ def simulate_network_traffic():
                 create_alert(traffic_data, features)
                 triggered_alert = True
             else:
-                logger.info(f"False positive filtered: {ATTACK_TYPES[prediction]} "
-                           f"(confidence: {max_confidence:.3f}, attack_prob: {attack_probability:.3f}, "
-                           f"features: packet_rate={features[0]:.1f}, udp_ratio={features[3]:.3f})")
+                # Only log false positive if this attack type appears in recent alerts
+                if has_recent_alerts_for_attack_type(ATTACK_TYPES[prediction]):
+                    logger.info(f"False positive filtered: {ATTACK_TYPES[prediction]} "
+                               f"(confidence: {max_confidence:.3f}, attack_prob: {attack_probability:.3f}, "
+                               f"features: packet_rate={features[0]:.1f}, udp_ratio={features[3]:.3f})")
         
         # Log ML model output to file
         log_ml_prediction(features, prediction, probabilities, traffic_data, triggered_alert)
         
         time.sleep(1)  # Simulate 1 second intervals
+
+def has_recent_alerts_for_attack_type(attack_type, time_window=60):
+    """Check if there are any recent alerts for the given attack type (within last 60 seconds)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    current_time = time.time()
+    time_threshold = current_time - time_window
+    
+    cursor.execute('''
+        SELECT COUNT(*) FROM alerts 
+        WHERE attack_type = ? AND timestamp >= ?
+    ''', (attack_type, time_threshold))
+    
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
 
 def is_valid_attack_detection(traffic_data, features, attack_probability):
     """
@@ -1103,7 +1121,35 @@ dashboard_template = '''
             font-size: 1.3em;
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 10px;
+        }
+        
+        .reset-btn {
+            padding: 8px 16px;
+            border: none;
+            border-radius: 8px;
+            font-size: 0.85em;
+            font-weight: bold;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            background: linear-gradient(135deg, #64748b 0%, #475569 100%);
+            color: white;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        
+        .reset-btn:hover {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(239, 68, 68, 0.3);
+        }
+        
+        .reset-btn:active {
+            transform: translateY(0);
         }
         
         .attack-buttons {
@@ -1253,7 +1299,12 @@ dashboard_template = '''
         </div>
         
         <div class="attack-generator">
-            <h3><i class="fas fa-bomb"></i> Attack Generator (Testing Mode)</h3>
+            <h3>
+                <span><i class="fas fa-bomb"></i> Attack Generator (Testing Mode)</span>
+                <button class="reset-btn" onclick="resetStats()" title="Reset all dashboard stats">
+                    <i class="fas fa-redo"></i> Reset
+                </button>
+            </h3>
             <p style="color: #94a3b8; margin-bottom: 15px;">Manually trigger attacks to test the detection system</p>
             <div class="attack-buttons">
                 <button class="attack-btn syn-flood" onclick="triggerAttack('SYN_Flood')">
@@ -1610,6 +1661,51 @@ dashboard_template = '''
                 .catch(error => console.error('Error fetching alerts:', error));
         }
         
+        // Reset stats function
+        function resetStats() {
+            if (!confirm('Are you sure you want to reset all dashboard stats? This will clear all alerts, mitigation history, and reset counters.')) {
+                return;
+            }
+            
+            const statusDiv = document.getElementById('attack-status');
+            statusDiv.className = 'attack-status';
+            statusDiv.textContent = 'Resetting dashboard stats...';
+            statusDiv.classList.add('success');
+            
+            fetch('/api/reset-stats', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.textContent = 'Dashboard stats reset successfully!';
+                    statusDiv.classList.remove('success');
+                    statusDiv.classList.add('success');
+                    // Refresh dashboard immediately
+                    setTimeout(updateDashboard, 300);
+                } else {
+                    statusDiv.textContent = `Error: ${data.message || 'Failed to reset stats'}`;
+                    statusDiv.classList.remove('success');
+                    statusDiv.classList.add('error');
+                }
+                // Hide status after 3 seconds
+                setTimeout(() => {
+                    statusDiv.className = 'attack-status';
+                }, 3000);
+            })
+            .catch(error => {
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.classList.remove('success');
+                statusDiv.classList.add('error');
+                setTimeout(() => {
+                    statusDiv.className = 'attack-status';
+                }, 3000);
+            });
+        }
+        
         // Attack generator function
         function triggerAttack(attackType) {
             const statusDiv = document.getElementById('attack-status');
@@ -1674,15 +1770,43 @@ def get_stats():
 
 @app.route('/api/traffic')
 def get_traffic():
-    """Get real-time traffic data from the last 30 seconds only"""
+    """Get real-time traffic data from the last 30 seconds only.
+    Only shows attack traffic if it appears in Recent Alerts (has corresponding alert in database)."""
     current_time = time.time()
     thirty_seconds_ago = current_time - 30  # Last 30 seconds for real-time view
     
+    # Get all alerts from database to cross-reference
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT timestamp, attack_type FROM alerts 
+        WHERE timestamp >= ?
+    ''', (thirty_seconds_ago,))
+    alerts_data = cursor.fetchall()
+    conn.close()
+    
+    # Create a set of alert timestamps with ±2 second window for matching
+    # This allows matching traffic that was created slightly before/after the alert
+    alert_timestamps = set()
+    for alert_ts, attack_type in alerts_data:
+        # Allow ±2 second window for matching (traffic might be logged slightly before alert)
+        for offset in range(-2, 3):
+            alert_timestamps.add((int(alert_ts) + offset, attack_type))
+    
     # Filter traffic buffer to only include data from last 30 seconds
-    recent_traffic = [
-        traffic for traffic in traffic_buffer 
-        if traffic.get('timestamp', 0) >= thirty_seconds_ago
-    ]
+    recent_traffic = []
+    for traffic in traffic_buffer:
+        traffic_ts = traffic.get('timestamp', 0)
+        if traffic_ts >= thirty_seconds_ago:
+            prediction = traffic.get('prediction', 0)
+            attack_type = traffic.get('attack_type', 'Normal')
+            
+            # Always include normal traffic (prediction == 0)
+            if prediction == 0:
+                recent_traffic.append(traffic)
+            # Only include attack traffic if there's a corresponding alert
+            elif (int(traffic_ts), attack_type) in alert_timestamps:
+                recent_traffic.append(traffic)
     
     # Sort by timestamp (oldest first) and limit to latest 30 data points max
     recent_traffic.sort(key=lambda x: x.get('timestamp', 0))
@@ -1780,6 +1904,41 @@ def trigger_attack():
         })
     except Exception as e:
         logger.error(f"Error triggering attack: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/reset-stats', methods=['POST'])
+def reset_stats():
+    """API endpoint to reset all dashboard stats by clearing the database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Clear all alerts
+        cursor.execute('DELETE FROM alerts')
+        
+        # Clear all mitigation history
+        cursor.execute('DELETE FROM mitigation_history')
+        
+        # Reset stats table (set total_requests to 0, ensure it exists)
+        cursor.execute('''
+            INSERT OR REPLACE INTO stats (key, value, updated_at) 
+            VALUES ('total_requests', 0, CURRENT_TIMESTAMP)
+        ''')
+        
+        # Clear any other stats if they exist
+        cursor.execute('DELETE FROM stats WHERE key != ?', ('total_requests',))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info("Dashboard stats reset: All alerts, mitigation history, and stats cleared")
+        
+        return jsonify({
+            'success': True,
+            'message': 'All dashboard stats have been reset successfully'
+        })
+    except Exception as e:
+        logger.error(f"Error resetting stats: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == '__main__':
