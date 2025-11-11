@@ -1582,10 +1582,12 @@ dashboard_template = '''
                         });
                         
                         // Extract packet_rate from features array (features[0] is packet_rate)
+                        // Clamp values to max 1000 to prevent chart breaking
                         const normalTraffic = data.map(d => {
                             if (d.prediction === 0) {
                                 if (d.features && Array.isArray(d.features) && d.features.length > 0) {
-                                    return Math.round(d.features[0] || 0); // packet_rate
+                                    const packetRate = Math.round(d.features[0] || 0);
+                                    return Math.min(packetRate, 1000); // Clamp to max 1000
                                 }
                                 // Fallback: if no features, return 0
                                 return 0;
@@ -1595,7 +1597,8 @@ dashboard_template = '''
                         const attackTraffic = data.map(d => {
                             if (d.prediction > 0) {
                                 if (d.features && Array.isArray(d.features) && d.features.length > 0) {
-                                    return Math.round(d.features[0] || 0); // packet_rate
+                                    const packetRate = Math.round(d.features[0] || 0);
+                                    return Math.min(packetRate, 1000); // Clamp to max 1000
                                 }
                                 // Fallback: if no features, return 0
                                 return 0;
@@ -1603,12 +1606,30 @@ dashboard_template = '''
                             return null; // null values won't be plotted
                         });
                         
+                        // Ensure labels and data arrays have same length
+                        if (labels.length !== normalTraffic.length || labels.length !== attackTraffic.length) {
+                            console.error('Chart data length mismatch:', {
+                                labels: labels.length,
+                                normal: normalTraffic.length,
+                                attack: attackTraffic.length
+                            });
+                            // Truncate to shortest length
+                            const minLength = Math.min(labels.length, normalTraffic.length, attackTraffic.length);
+                            labels.splice(minLength);
+                            normalTraffic.splice(minLength);
+                            attackTraffic.splice(minLength);
+                        }
+                        
                         // Update chart with real-time data
-                        trafficChart.data.labels = labels;
-                        trafficChart.data.datasets[0].data = normalTraffic;
-                        trafficChart.data.datasets[1].data = attackTraffic;
-                        // Force update with animation to ensure Y-axis scale is applied
-                        trafficChart.update();
+                        try {
+                            trafficChart.data.labels = labels;
+                            trafficChart.data.datasets[0].data = normalTraffic;
+                            trafficChart.data.datasets[1].data = attackTraffic;
+                            // Use 'none' mode for smoother updates during attacks
+                            trafficChart.update('none');
+                        } catch (error) {
+                            console.error('Error updating traffic chart:', error);
+                        }
                     } else {
                         // No real-time data, clear chart
                         trafficChart.data.labels = [];
