@@ -1,5 +1,39 @@
 # Bug Reports and Fixes
 
+## Bug: Flask App Cannot Run with Uvicorn (ASGI/WSGI Mismatch)
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+Attempting to run Flask application with uvicorn resulted in errors:
+```
+TypeError: Flask.__call__() missing 1 required positional argument: 'start_response'
+```
+
+All API endpoints returned 500 Internal Server Error.
+
+### Root Cause
+- Flask is a **WSGI** (Web Server Gateway Interface) application
+- Uvicorn is an **ASGI** (Asynchronous Server Gateway Interface) server
+- These are incompatible protocols - uvicorn cannot run WSGI applications directly
+
+### Solution
+Use the correct server for Flask:
+- **Development**: `python app.py` or `python3 app.py` (uses Flask's built-in WSGI server)
+- **Production**: `gunicorn app:app --bind 0.0.0.0:8888` (uses Gunicorn WSGI server)
+
+### Code Changes
+- No code changes needed
+- Use correct command: `python3 app.py` instead of `uvicorn app:app`
+
+### Testing
+- Verified Flask app runs correctly with `python3 app.py`
+- All API endpoints now respond correctly
+- Dashboard accessible at http://localhost:8888
+
+---
+
 ## Bug: Incorrect Threat Count Display
 
 **Date:** 2025-11-11  
