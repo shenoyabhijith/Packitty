@@ -110,11 +110,29 @@ def init_database():
         )
     ''')
     
+    # Create stats table to track total requests
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS stats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            key TEXT UNIQUE NOT NULL,
+            value INTEGER DEFAULT 0,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Initialize total_requests counter if it doesn't exist
+    cursor.execute('''
+        INSERT OR IGNORE INTO stats (key, value) 
+        VALUES ('total_requests', 0)
+    ''')
+    
     # Create indexes for better query performance
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_source_ip ON alerts(source_ip)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_alert_id ON mitigation_history(alert_id)')
     cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_timestamp ON mitigation_history(timestamp DESC)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_action ON mitigation_history(action)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_status ON mitigation_history(status)')
     
     conn.commit()
     conn.close()
@@ -134,8 +152,7 @@ except:
 
 # Global data structures for real-time monitoring
 traffic_buffer = deque(maxlen=1000)
-blocked_ips = set()  # Keep in memory for quick lookups
-total_requests_count = 0  # Track total requests since startup
+# Note: blocked_ips and total_requests_count are now tracked in database
 
 # Detection thresholds and validation
 CONFIDENCE_THRESHOLD = 0.95  # Increased to 0.95 to reduce false positives
@@ -291,8 +308,15 @@ def generate_attack_traffic(attack_type_name):
     }
     
     traffic_buffer.append(traffic_data)
-    global total_requests_count
-    total_requests_count += 1
+    # Update total requests counter in database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP 
+        WHERE key = 'total_requests'
+    ''')
+    conn.commit()
+    conn.close()
     
     # Log first prediction
     triggered_alert_first = False
@@ -326,7 +350,15 @@ def generate_attack_traffic(attack_type_name):
         }
         
         traffic_buffer.append(traffic_data_var)
-        total_requests_count += 1
+        # Update total requests counter in database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP 
+            WHERE key = 'total_requests'
+        ''')
+        conn.commit()
+        conn.close()
         
         # Trigger alert if validation passes
         triggered_alert_var = False
@@ -403,8 +435,15 @@ def simulate_network_traffic():
         }
         
         traffic_buffer.append(traffic_data)
-        global total_requests_count
-        total_requests_count += 1
+        # Update total requests counter in database
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE stats SET value = value + 1, updated_at = CURRENT_TIMESTAMP 
+            WHERE key = 'total_requests'
+        ''')
+        conn.commit()
+        conn.close()
         
         # Validate if this is truly an attack (not a false positive)
         triggered_alert = False
@@ -732,46 +771,44 @@ def execute_mitigation(alert):
     return {'action': action, 'status': status, 'reasoning': reasoning, 'ai_powered': use_ai}
 
 def calculate_statistics():
-    """Calculate real-time statistics"""
-    if not traffic_buffer:
-        return {
-            'total_requests': 0,
-            'threats_detected': 0,
-            'blocked_ips': 0,
-            'mitigation_rate': 0,
-            'ai_mitigations': 0,
-            'attack_distribution': {}
-        }
-    
-    # Use total count since startup, not just buffer size
-    total_requests = total_requests_count
-    # Count only actual alerts from database (not false positives that were filtered)
+    """Calculate real-time statistics - all from database"""
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
+    
+    # Get total requests from stats table
+    cursor.execute('SELECT value FROM stats WHERE key = ?', ('total_requests',))
+    result = cursor.fetchone()
+    total_requests = result[0] if result else 0
+    
+    # Count only actual alerts from database (not false positives that were filtered)
     cursor.execute('SELECT COUNT(*) FROM alerts')
     threats_detected = cursor.fetchone()[0]
-    conn.close()
+    
+    # Count blocked IPs from mitigation_history (distinct IPs with BLOCK action and MITIGATED status)
+    cursor.execute('''
+        SELECT COUNT(DISTINCT source_ip) FROM mitigation_history 
+        WHERE action = 'BLOCK' AND status = 'MITIGATED'
+    ''')
+    blocked_ips_count = cursor.fetchone()[0]
     
     # Calculate AI-powered mitigations from database
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
     cursor.execute('SELECT COUNT(*) FROM mitigation_history WHERE ai_powered = 1')
     ai_mitigations = cursor.fetchone()[0]
-    conn.close()
     
     # Calculate attack distribution from database
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
     cursor.execute('SELECT attack_type, COUNT(*) as count FROM alerts GROUP BY attack_type')
     attack_dist = {row[0]: row[1] for row in cursor.fetchall()}
+    
+    # Count total mitigations
     cursor.execute('SELECT COUNT(*) FROM mitigation_history')
     mitigation_rate = cursor.fetchone()[0]
+    
     conn.close()
     
     return {
         'total_requests': total_requests,
         'threats_detected': threats_detected,
-        'blocked_ips': len(blocked_ips),
+        'blocked_ips': blocked_ips_count,
         'mitigation_rate': mitigation_rate,
         'ai_mitigations': ai_mitigations,
         'attack_distribution': attack_dist,
