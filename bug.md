@@ -1,5 +1,58 @@
 # Bug Reports and Fixes
 
+## Bug: Incorrect Threat Count Display
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+The dashboard was showing incorrect threat counts (e.g., 183 threats) because it was counting ALL attack predictions in the traffic buffer, including false positives that were filtered out by validation.
+
+### Root Cause
+In `calculate_statistics()`, the code was using:
+```python
+threats_detected = len([t for t in traffic_buffer if t['prediction'] > 0])
+```
+This counted every prediction > 0, even though many were filtered as false positives and never created actual alerts.
+
+### Solution Implemented
+Changed to count only actual alerts that passed validation:
+```python
+# Count only actual alerts (not false positives that were filtered)
+threats_detected = len(alerts)
+```
+Now the threat count accurately reflects only validated threats that triggered alerts.
+
+### Code Changes
+- Modified `calculate_statistics()` in `app.py` line 597
+- Changed from counting predictions to counting actual alerts
+
+---
+
+## Bug: Excessive API Request Logging
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+Logs were constantly showing werkzeug INFO messages for every API request from the dashboard (e.g., `35.146.115.81 - - [11/Nov/2025 19:36:52] "GET /api/stats HTTP/1.1" 200 -`), making logs noisy and hard to read.
+
+### Root Cause
+Werkzeug (Flask's WSGI server) was set to INFO level, logging every HTTP request including normal dashboard polling.
+
+### Solution Implemented
+Reduced werkzeug logging verbosity to WARNING level:
+```python
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+```
+Now only warnings and errors are logged, not routine API requests.
+
+### Code Changes
+- Added werkzeug logger configuration in `app.py` line 23
+- Set level to WARNING to suppress INFO-level request logs
+
+---
+
 ## Bug: Random False Positive Attack Detections
 
 **Date:** 2024-12-19  
