@@ -19,6 +19,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Reduce werkzeug (Flask) logging verbosity for API requests
+logging.getLogger('werkzeug').setLevel(logging.WARNING)
+
 # Import AI Agent module
 try:
     from ai_agent import get_ai_agent
@@ -593,7 +596,8 @@ def calculate_statistics():
         }
     
     total_requests = len(traffic_buffer)
-    threats_detected = len([t for t in traffic_buffer if t['prediction'] > 0])
+    # Count only actual alerts (not false positives that were filtered)
+    threats_detected = len(alerts)
     
     # Calculate AI-powered mitigations
     ai_mitigations = len([m for m in mitigation_history if m.get('ai_powered', False)])
