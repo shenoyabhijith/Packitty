@@ -1411,6 +1411,7 @@ dashboard_template = '''
                     y: {
                         ticks: { color: '#94a3b8' },
                         grid: { color: 'rgba(148, 163, 184, 0.1)' },
+                        min: 0,
                         max: 10000,
                         title: {
                             display: true,
@@ -1551,7 +1552,7 @@ dashboard_template = '''
                 })
                 .catch(error => console.error('Error fetching mitigation history:', error));
             
-            // Update traffic chart (real-time: last 30 seconds only)
+            // Update traffic chart (real-time: last 20 seconds only)
             fetch('/api/traffic')
                 .then(response => response.json())
                 .then(data => {
@@ -1568,14 +1569,22 @@ dashboard_template = '''
                         
                         // Extract packet_rate from features array (features[0] is packet_rate)
                         const normalTraffic = data.map(d => {
-                            if (d.prediction === 0 && d.features && Array.isArray(d.features) && d.features.length > 0) {
-                                return Math.round(d.features[0] || 0); // packet_rate
+                            if (d.prediction === 0) {
+                                if (d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                    return Math.round(d.features[0] || 0); // packet_rate
+                                }
+                                // Fallback: if no features, return 0
+                                return 0;
                             }
                             return null; // null values won't be plotted
                         });
                         const attackTraffic = data.map(d => {
-                            if (d.prediction > 0 && d.features && Array.isArray(d.features) && d.features.length > 0) {
-                                return Math.round(d.features[0] || 0); // packet_rate
+                            if (d.prediction > 0) {
+                                if (d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                    return Math.round(d.features[0] || 0); // packet_rate
+                                }
+                                // Fallback: if no features, return 0
+                                return 0;
                             }
                             return null; // null values won't be plotted
                         });
@@ -1584,7 +1593,8 @@ dashboard_template = '''
                         trafficChart.data.labels = labels;
                         trafficChart.data.datasets[0].data = normalTraffic;
                         trafficChart.data.datasets[1].data = attackTraffic;
-                        trafficChart.update('none'); // 'none' mode for smoother real-time updates
+                        // Force update with animation to ensure Y-axis scale is applied
+                        trafficChart.update();
                     } else {
                         // No real-time data, clear chart
                         trafficChart.data.labels = [];
@@ -1787,10 +1797,10 @@ def get_stats():
 
 @app.route('/api/traffic')
 def get_traffic():
-    """Get real-time traffic data from the last 30 seconds only.
+    """Get real-time traffic data from the last 20 seconds only.
     Only shows attack traffic if it appears in Recent Alerts (has corresponding alert in database)."""
     current_time = time.time()
-    thirty_seconds_ago = current_time - 30  # Last 30 seconds for real-time view
+    twenty_seconds_ago = current_time - 20  # Last 20 seconds for real-time view
     
     # Get all alerts from database to cross-reference
     conn = sqlite3.connect(DB_PATH)
@@ -1798,7 +1808,7 @@ def get_traffic():
     cursor.execute('''
         SELECT timestamp, attack_type FROM alerts 
         WHERE timestamp >= ?
-    ''', (thirty_seconds_ago,))
+    ''', (twenty_seconds_ago,))
     alerts_data = cursor.fetchall()
     conn.close()
     
@@ -1810,11 +1820,11 @@ def get_traffic():
         for offset in range(-2, 3):
             alert_timestamps.add((int(alert_ts) + offset, attack_type))
     
-    # Filter traffic buffer to only include data from last 30 seconds
+    # Filter traffic buffer to only include data from last 20 seconds
     recent_traffic = []
     for traffic in traffic_buffer:
         traffic_ts = traffic.get('timestamp', 0)
-        if traffic_ts >= thirty_seconds_ago:
+        if traffic_ts >= twenty_seconds_ago:
             prediction = traffic.get('prediction', 0)
             attack_type = traffic.get('attack_type', 'Normal')
             
@@ -1825,9 +1835,9 @@ def get_traffic():
             elif (int(traffic_ts), attack_type) in alert_timestamps:
                 recent_traffic.append(traffic)
     
-    # Sort by timestamp (oldest first) and limit to latest 30 data points max
+    # Sort by timestamp (oldest first) and limit to latest 20 data points max
     recent_traffic.sort(key=lambda x: x.get('timestamp', 0))
-    recent_traffic = recent_traffic[-30:]  # Keep only last 30 data points
+    recent_traffic = recent_traffic[-20:]  # Keep only last 20 data points
     
     return jsonify(recent_traffic)
 
