@@ -1380,14 +1380,14 @@ dashboard_template = '''
             data: {
                 labels: [],
                 datasets: [{
-                    label: 'Normal Traffic',
+                    label: 'Normal Traffic (Packets/sec)',
                     data: [],
                     borderColor: chartColors.success,
                     backgroundColor: chartColors.success + '20',
                     tension: 0.4,
                     fill: true
                 }, {
-                    label: 'Attack Traffic',
+                    label: 'Attack Traffic (Packets/sec)',
                     data: [],
                     borderColor: chartColors.danger,
                     backgroundColor: chartColors.danger + '20',
@@ -1410,7 +1410,13 @@ dashboard_template = '''
                     },
                     y: {
                         ticks: { color: '#94a3b8' },
-                        grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        grid: { color: 'rgba(148, 163, 184, 0.1)' },
+                        max: 10000,
+                        title: {
+                            display: true,
+                            text: 'Packets/sec',
+                            color: '#94a3b8'
+                        }
                     }
                 }
             }
@@ -1560,8 +1566,19 @@ dashboard_template = '''
                             return `${secondsAgo}s ago`;
                         });
                         
-                        const normalTraffic = data.map(d => d.prediction === 0 ? 1 : 0);
-                        const attackTraffic = data.map(d => d.prediction > 0 ? 1 : 0);
+                        // Extract packet_rate from features array (features[0] is packet_rate)
+                        const normalTraffic = data.map(d => {
+                            if (d.prediction === 0 && d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                return Math.round(d.features[0] || 0); // packet_rate
+                            }
+                            return null; // null values won't be plotted
+                        });
+                        const attackTraffic = data.map(d => {
+                            if (d.prediction > 0 && d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                return Math.round(d.features[0] || 0); // packet_rate
+                            }
+                            return null; // null values won't be plotted
+                        });
                         
                         // Update chart with real-time data
                         trafficChart.data.labels = labels;
