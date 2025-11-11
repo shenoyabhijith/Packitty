@@ -1583,27 +1583,30 @@ dashboard_template = '''
                         
                         // Extract packet_rate from features array (features[0] is packet_rate)
                         // Clamp values to max 1000 to prevent chart breaking
+                        // Use 0 instead of null to maintain continuous lines
                         const normalTraffic = data.map(d => {
                             if (d.prediction === 0) {
+                                // Normal traffic - show actual packet rate
                                 if (d.features && Array.isArray(d.features) && d.features.length > 0) {
                                     const packetRate = Math.round(d.features[0] || 0);
                                     return Math.min(packetRate, 1000); // Clamp to max 1000
                                 }
-                                // Fallback: if no features, return 0
                                 return 0;
                             }
-                            return null; // null values won't be plotted
+                            // During attacks, show 0 for normal traffic to maintain line continuity
+                            return 0;
                         });
                         const attackTraffic = data.map(d => {
                             if (d.prediction > 0) {
+                                // Attack traffic - show actual packet rate
                                 if (d.features && Array.isArray(d.features) && d.features.length > 0) {
                                     const packetRate = Math.round(d.features[0] || 0);
                                     return Math.min(packetRate, 1000); // Clamp to max 1000
                                 }
-                                // Fallback: if no features, return 0
                                 return 0;
                             }
-                            return null; // null values won't be plotted
+                            // During normal traffic, show 0 for attack traffic to maintain line continuity
+                            return 0;
                         });
                         
                         // Ensure labels and data arrays have same length
