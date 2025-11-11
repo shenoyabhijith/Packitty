@@ -1513,8 +1513,8 @@ dashboard_template = '''
                         return;
                     }
                     
-                    // Data is already sorted DESC from API, just take latest 10
-                    container.innerHTML = data.slice(0, 10).map(alert => {
+                    // Data is already sorted DESC from API, just take latest 5
+                    container.innerHTML = data.slice(0, 5).map(alert => {
                         const time = new Date(alert.timestamp * 1000).toLocaleTimeString();
                         const severityClass = `alert-${alert.severity}`;
                         const actionClass = `action-${alert.mitigation_action || 'PENDING'}`;
