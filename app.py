@@ -20,8 +20,19 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Reduce werkzeug (Flask) logging verbosity for API requests
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
+# Custom filter to suppress 400 Bad Request errors from scanners/bots
+class SuppressBadRequestFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress werkzeug 400 errors (malformed requests from scanners)
+        if 'werkzeug' in record.name:
+            if 'code 400' in str(record.getMessage()) or 'Bad request' in str(record.getMessage()):
+                return False
+        return True
+
+# Apply filter to werkzeug logger
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.addFilter(SuppressBadRequestFilter())
+werkzeug_logger.setLevel(logging.ERROR)  # Only log errors, suppress warnings and 400 bad requests
 
 # Import AI Agent module
 try:
@@ -64,6 +75,12 @@ def initialize_ml_log_file():
             f.write(header)
 
 app = Flask(__name__)
+
+# Suppress 400 Bad Request errors from malformed requests (scanners/bots)
+@app.errorhandler(400)
+def handle_bad_request(e):
+    """Silently handle 400 Bad Request errors to reduce log noise from scanners"""
+    return '', 400
 
 # Database configuration
 DB_PATH = os.getenv('DB_PATH', 'packitty.db')
