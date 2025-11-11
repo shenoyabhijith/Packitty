@@ -1430,18 +1430,33 @@ dashboard_template = '''
                 })
                 .catch(error => console.error('Error fetching mitigation history:', error));
             
-            // Update traffic chart
+            // Update traffic chart (shows last 1 minute of data)
             fetch('/api/traffic')
                 .then(response => response.json())
                 .then(data => {
                     if (data.length > 0) {
-                        const labels = data.map((_, index) => index + 1);
+                        // Sort by timestamp to ensure chronological order
+                        data.sort((a, b) => a.timestamp - b.timestamp);
+                        
+                        // Create time-based labels (seconds ago)
+                        const currentTime = Date.now() / 1000;
+                        const labels = data.map(d => {
+                            const secondsAgo = Math.floor(currentTime - d.timestamp);
+                            return secondsAgo <= 0 ? 'now' : `${secondsAgo}s ago`;
+                        });
+                        
                         const normalTraffic = data.map(d => d.prediction === 0 ? 1 : 0);
                         const attackTraffic = data.map(d => d.prediction > 0 ? 1 : 0);
                         
                         trafficChart.data.labels = labels;
                         trafficChart.data.datasets[0].data = normalTraffic;
                         trafficChart.data.datasets[1].data = attackTraffic;
+                        trafficChart.update();
+                    } else {
+                        // No data in last minute, clear chart
+                        trafficChart.data.labels = [];
+                        trafficChart.data.datasets[0].data = [];
+                        trafficChart.data.datasets[1].data = [];
                         trafficChart.update();
                     }
                 })
