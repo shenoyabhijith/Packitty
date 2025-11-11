@@ -10,6 +10,7 @@ import logging
 from datetime import datetime
 import random
 import os
+import sqlite3
 from dotenv import load_dotenv
 
 # Load environment variables from .env file
@@ -64,6 +65,64 @@ def initialize_ml_log_file():
 
 app = Flask(__name__)
 
+# Database configuration
+DB_PATH = os.getenv('DB_PATH', 'packitty.db')
+
+def init_database():
+    """Initialize SQLite database with alerts and mitigation_history tables"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    # Create alerts table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            attack_type TEXT NOT NULL,
+            source_ip TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            confidence REAL NOT NULL,
+            packet_rate REAL,
+            byte_rate REAL,
+            connection_rate REAL,
+            status TEXT NOT NULL,
+            mitigation_action TEXT,
+            ai_powered INTEGER DEFAULT 0,
+            ai_reasoning TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create mitigation_history table
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS mitigation_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL NOT NULL,
+            alert_id INTEGER NOT NULL,
+            action TEXT NOT NULL,
+            command TEXT,
+            status TEXT NOT NULL,
+            source_ip TEXT NOT NULL,
+            reasoning TEXT,
+            ai_powered INTEGER DEFAULT 0,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (alert_id) REFERENCES alerts(id)
+        )
+    ''')
+    
+    # Create indexes for better query performance
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts(timestamp DESC)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_alerts_source_ip ON alerts(source_ip)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_alert_id ON mitigation_history(alert_id)')
+    cursor.execute('CREATE INDEX IF NOT EXISTS idx_mitigation_timestamp ON mitigation_history(timestamp DESC)')
+    
+    conn.commit()
+    conn.close()
+    logger.info(f"Database initialized: {DB_PATH}")
+
+# Initialize database on startup
+init_database()
+
 # Load the trained model
 try:
     model = joblib.load('ddos_model.pkl')
@@ -75,9 +134,7 @@ except:
 
 # Global data structures for real-time monitoring
 traffic_buffer = deque(maxlen=1000)
-alerts = deque(maxlen=100)
-blocked_ips = set()
-mitigation_history = deque(maxlen=50)
+blocked_ips = set()  # Keep in memory for quick lookups
 
 # Detection thresholds and validation
 CONFIDENCE_THRESHOLD = 0.90  # Increased to 0.90 to further reduce false positives
@@ -443,8 +500,33 @@ def create_alert(traffic_data, features):
     # Generate random private IP address
     source_ip = generate_private_ip()
     
+    # Insert alert into database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    
+    cursor.execute('''
+        INSERT INTO alerts (timestamp, attack_type, source_ip, severity, confidence,
+                           packet_rate, byte_rate, connection_rate, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        traffic_data['timestamp'],
+        attack_type,
+        source_ip,
+        severity,
+        traffic_data['confidence'],
+        features[0],  # packet_rate
+        features[1],  # byte_rate
+        features[5],  # connection_rate
+        'DETECTED'
+    ))
+    
+    alert_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    
+    # Create alert dict for immediate use
     alert = {
-        'id': len(alerts) + 1,
+        'id': alert_id,
         'timestamp': traffic_data['timestamp'],
         'attack_type': attack_type,
         'source_ip': source_ip,
@@ -459,11 +541,28 @@ def create_alert(traffic_data, features):
         'mitigation_action': None
     }
     
-    alerts.append(alert)
     logger.warning(f"ALERT: {attack_type} detected from {source_ip} (confidence: {traffic_data['confidence']:.3f})")
     
     # Trigger mitigation
     mitigation_result = execute_mitigation(alert)
+    
+    # Update alert in database with mitigation info
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        UPDATE alerts 
+        SET mitigation_action = ?, status = ?, ai_powered = ?, ai_reasoning = ?
+        WHERE id = ?
+    ''', (
+        mitigation_result['action'],
+        mitigation_result['status'],
+        1 if mitigation_result.get('ai_powered', False) else 0,
+        mitigation_result.get('reasoning', ''),
+        alert_id
+    ))
+    conn.commit()
+    conn.close()
+    
     alert['mitigation_action'] = mitigation_result['action']
     alert['status'] = mitigation_result['status']
     alert['ai_powered'] = mitigation_result.get('ai_powered', False)
@@ -478,18 +577,25 @@ def execute_mitigation(alert):
     source_ip = alert['source_ip']
     severity = alert['severity']
     
-    # Get recent alerts for context
+    # Get recent alerts for context from database
     current_time = time.time()
-    recent_alerts = [
-        a for a in alerts 
-        if (current_time - a.get('timestamp', 0)) <= 300  # Last 5 minutes
-    ]
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT * FROM alerts 
+        WHERE timestamp >= ? 
+        ORDER BY timestamp DESC
+    ''', (current_time - 300,))  # Last 5 minutes
+    recent_alerts = [dict(row) for row in cursor.fetchall()]
+    conn.close()
     
     # Get system statistics
     system_stats = calculate_statistics()
     
     # Use AI agent for intelligent decision making
     use_ai = os.getenv('USE_AI_AGENT', 'true').lower() == 'true' and AI_AGENT_AVAILABLE
+    recommendation = None
     
     if use_ai:
         try:
@@ -508,6 +614,7 @@ def execute_mitigation(alert):
         except Exception as e:
             logger.error(f"AI agent error: {e}, falling back to rule-based")
             use_ai = False
+            recommendation = None
     
     # Fallback to rule-based if AI not available or failed
     if not use_ai:
@@ -519,7 +626,7 @@ def execute_mitigation(alert):
             reasoning = f"Rule-based: Moderate {attack_type} attack"
     
     # Execute UFW command if AI already executed it via tool calling
-    tool_executed = recommendation.get('tool_executed', False)
+    tool_executed = recommendation.get('tool_executed', False) if recommendation else False
     
     if tool_executed:
         # AI already executed the UFW command via tool calling
@@ -565,6 +672,26 @@ def execute_mitigation(alert):
             ufw_command = f"# Monitor {source_ip} - no action taken"
             status = 'MONITORING'
     
+    # Insert mitigation record into database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        INSERT INTO mitigation_history 
+        (timestamp, alert_id, action, command, status, source_ip, reasoning, ai_powered)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ''', (
+        time.time(),
+        alert['id'],
+        action,
+        ufw_command,
+        status,
+        source_ip,
+        reasoning if use_ai else 'Rule-based decision',
+        1 if use_ai else 0
+    ))
+    conn.commit()
+    conn.close()
+    
     mitigation_record = {
         'timestamp': time.time(),
         'alert_id': alert['id'],
@@ -576,7 +703,6 @@ def execute_mitigation(alert):
         'ai_powered': use_ai
     }
     
-    mitigation_history.append(mitigation_record)
     logger.info(f"MITIGATION: {action} executed for {source_ip} - Status: {status}")
     if use_ai:
         logger.info(f"AI Reasoning: {reasoning}")
@@ -596,23 +722,34 @@ def calculate_statistics():
         }
     
     total_requests = len(traffic_buffer)
-    # Count only actual alerts (not false positives that were filtered)
-    threats_detected = len(alerts)
+    # Count only actual alerts from database (not false positives that were filtered)
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM alerts')
+    threats_detected = cursor.fetchone()[0]
+    conn.close()
     
-    # Calculate AI-powered mitigations
-    ai_mitigations = len([m for m in mitigation_history if m.get('ai_powered', False)])
+    # Calculate AI-powered mitigations from database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM mitigation_history WHERE ai_powered = 1')
+    ai_mitigations = cursor.fetchone()[0]
+    conn.close()
     
-    # Calculate attack distribution
-    attack_dist = {}
-    for traffic in traffic_buffer:
-        attack_type = traffic['attack_type']
-        attack_dist[attack_type] = attack_dist.get(attack_type, 0) + 1
+    # Calculate attack distribution from database
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('SELECT attack_type, COUNT(*) as count FROM alerts GROUP BY attack_type')
+    attack_dist = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.execute('SELECT COUNT(*) FROM mitigation_history')
+    mitigation_rate = cursor.fetchone()[0]
+    conn.close()
     
     return {
         'total_requests': total_requests,
         'threats_detected': threats_detected,
         'blocked_ips': len(blocked_ips),
-        'mitigation_rate': len(mitigation_history),
+        'mitigation_rate': mitigation_rate,
         'ai_mitigations': ai_mitigations,
         'attack_distribution': attack_dist,
         'uptime': time.time() - start_time
@@ -1438,28 +1575,35 @@ def get_traffic():
 
 @app.route('/api/alerts')
 def get_alerts():
-    # Ensure all alerts have AI information
+    """Fetch alerts from database with AI information"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # Get all alerts ordered by timestamp (most recent first)
+    cursor.execute('''
+        SELECT * FROM alerts 
+        ORDER BY timestamp DESC 
+        LIMIT 100
+    ''')
+    
     alerts_list = []
-    for alert in alerts:
-        # Convert to dict if needed
-        if isinstance(alert, dict):
-            alert_dict = alert.copy()
-        else:
-            alert_dict = dict(alert) if hasattr(alert, 'keys') else alert
-        
-        # Get mitigation history for this alert to include AI info
-        mitigation = next((m for m in mitigation_history if m.get('alert_id') == alert_dict.get('id')), None)
-        if mitigation:
-            alert_dict['ai_powered'] = mitigation.get('ai_powered', False)
-            alert_dict['ai_reasoning'] = mitigation.get('reasoning', '')
-        else:
-            # Fallback: check if alert already has AI info
-            if 'ai_powered' not in alert_dict:
-                alert_dict['ai_powered'] = False
-            if 'ai_reasoning' not in alert_dict:
-                alert_dict['ai_reasoning'] = ''
-        
+    for row in cursor.fetchall():
+        alert_dict = dict(row)
+        # Convert features to dict format for compatibility
+        alert_dict['features'] = {
+            'packet_rate': alert_dict.get('packet_rate'),
+            'byte_rate': alert_dict.get('byte_rate'),
+            'connection_rate': alert_dict.get('connection_rate')
+        }
+        # Convert ai_powered from integer to boolean
+        alert_dict['ai_powered'] = bool(alert_dict.get('ai_powered', 0))
+        # Remove None values for cleaner JSON
+        if alert_dict.get('ai_reasoning') is None:
+            alert_dict['ai_reasoning'] = ''
         alerts_list.append(alert_dict)
+    
+    conn.close()
     return jsonify(alerts_list)
 
 @app.route('/api/attack-distribution')
@@ -1469,7 +1613,27 @@ def get_attack_distribution():
 
 @app.route('/api/mitigation-history')
 def get_mitigation_history():
-    return jsonify(list(mitigation_history))
+    """Fetch mitigation history from database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.cursor()
+    
+    # Get all mitigation records ordered by timestamp (most recent first)
+    cursor.execute('''
+        SELECT * FROM mitigation_history 
+        ORDER BY timestamp DESC 
+        LIMIT 50
+    ''')
+    
+    mitigation_list = []
+    for row in cursor.fetchall():
+        mitigation_dict = dict(row)
+        # Convert ai_powered from integer to boolean
+        mitigation_dict['ai_powered'] = bool(mitigation_dict.get('ai_powered', 0))
+        mitigation_list.append(mitigation_dict)
+    
+    conn.close()
+    return jsonify(mitigation_list)
 
 @app.route('/api/trigger-attack', methods=['POST'])
 def trigger_attack():
