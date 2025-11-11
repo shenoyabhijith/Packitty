@@ -120,12 +120,19 @@ def init_database():
             command TEXT,
             status TEXT NOT NULL,
             source_ip TEXT NOT NULL,
+            attack_type TEXT,
             reasoning TEXT,
             ai_powered INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (alert_id) REFERENCES alerts(id)
         )
     ''')
+    
+    # Add attack_type column if it doesn't exist (migration for existing databases)
+    try:
+        cursor.execute('ALTER TABLE mitigation_history ADD COLUMN attack_type TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     # Create stats table to track total requests
     cursor.execute('''
@@ -770,8 +777,8 @@ def execute_mitigation(alert):
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO mitigation_history 
-        (timestamp, alert_id, action, command, status, source_ip, reasoning, ai_powered)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (timestamp, alert_id, action, command, status, source_ip, attack_type, reasoning, ai_powered)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         time.time(),
         alert['id'],
@@ -779,6 +786,7 @@ def execute_mitigation(alert):
         ufw_command,
         status,
         source_ip,
+        attack_type,
         reasoning if use_ai else 'Rule-based decision',
         1 if use_ai else 0
     ))
@@ -1529,17 +1537,23 @@ dashboard_template = '''
                         const actionIcon = decision.action === 'BLOCK' ? 'fa-ban' : 
                                          decision.action === 'RATE_LIMIT' ? 'fa-tachometer-alt' : 'fa-eye';
                         
+                        const attackType = decision.attack_type || 'Unknown';
+                        const attackTypeColor = '#f59e0b';
+                        
                         return `
                             <div style="background: rgba(15, 23, 42, 0.6); padding: 12px; margin-bottom: 10px; border-radius: 8px; border-left: 3px solid ${actionColor};">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                                     <div style="display: flex; align-items: center; gap: 8px;">
                                         <i class="fas ${actionIcon}" style="color: ${actionColor};"></i>
-                                        <strong style="color: ${actionColor};">${decision.action}</strong>
+                                        <strong style="color: ${actionColor};">${decision.action} MITIGATED</strong>
                                         <span style="background: ${statusColor}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold;">
                                             ${decision.status}
                                         </span>
                                     </div>
                                     <span style="color: #94a3b8; font-size: 0.85em;">${time}</span>
+                                </div>
+                                <div style="color: #cbd5e1; font-size: 0.9em; margin-bottom: 6px;">
+                                    <strong>Attack Type:</strong> <span style="color: ${attackTypeColor}; font-weight: bold;">${attackType}</span>
                                 </div>
                                 <div style="color: #cbd5e1; font-size: 0.9em; margin-bottom: 6px;">
                                     <strong>IP:</strong> ${decision.source_ip}
