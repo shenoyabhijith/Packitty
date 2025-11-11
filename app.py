@@ -135,6 +135,7 @@ except:
 # Global data structures for real-time monitoring
 traffic_buffer = deque(maxlen=1000)
 blocked_ips = set()  # Keep in memory for quick lookups
+total_requests_count = 0  # Track total requests since startup
 
 # Detection thresholds and validation
 CONFIDENCE_THRESHOLD = 0.90  # Increased to 0.90 to further reduce false positives
@@ -290,6 +291,8 @@ def generate_attack_traffic(attack_type_name):
     }
     
     traffic_buffer.append(traffic_data)
+    global total_requests_count
+    total_requests_count += 1
     
     # Log first prediction
     triggered_alert_first = False
@@ -323,6 +326,7 @@ def generate_attack_traffic(attack_type_name):
         }
         
         traffic_buffer.append(traffic_data_var)
+        total_requests_count += 1
         
         # Trigger alert if validation passes
         triggered_alert_var = False
@@ -399,6 +403,8 @@ def simulate_network_traffic():
         }
         
         traffic_buffer.append(traffic_data)
+        global total_requests_count
+        total_requests_count += 1
         
         # Validate if this is truly an attack (not a false positive)
         triggered_alert = False
@@ -721,7 +727,8 @@ def calculate_statistics():
             'attack_distribution': {}
         }
     
-    total_requests = len(traffic_buffer)
+    # Use total count since startup, not just buffer size
+    total_requests = total_requests_count
     # Count only actual alerts from database (not false positives that were filtered)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
