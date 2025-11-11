@@ -1578,7 +1578,17 @@ def get_stats():
 
 @app.route('/api/traffic')
 def get_traffic():
-    return jsonify(list(traffic_buffer))
+    """Get traffic data from the last 1 minute only"""
+    current_time = time.time()
+    one_minute_ago = current_time - 60  # Last 60 seconds
+    
+    # Filter traffic buffer to only include data from last 1 minute
+    recent_traffic = [
+        traffic for traffic in traffic_buffer 
+        if traffic.get('timestamp', 0) >= one_minute_ago
+    ]
+    
+    return jsonify(recent_traffic)
 
 @app.route('/api/alerts')
 def get_alerts():
