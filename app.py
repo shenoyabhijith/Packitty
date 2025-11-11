@@ -1447,34 +1447,35 @@ dashboard_template = '''
                 })
                 .catch(error => console.error('Error fetching mitigation history:', error));
             
-            // Update traffic chart (shows last 1 minute of data)
+            // Update traffic chart (real-time: last 30 seconds only)
             fetch('/api/traffic')
                 .then(response => response.json())
                 .then(data => {
                     if (data.length > 0) {
-                        // Sort by timestamp to ensure chronological order
-                        data.sort((a, b) => a.timestamp - b.timestamp);
-                        
-                        // Create time-based labels (seconds ago)
+                        // Data is already sorted by timestamp from API
+                        // Create real-time labels (seconds ago, most recent first)
                         const currentTime = Date.now() / 1000;
                         const labels = data.map(d => {
                             const secondsAgo = Math.floor(currentTime - d.timestamp);
-                            return secondsAgo <= 0 ? 'now' : `${secondsAgo}s ago`;
+                            if (secondsAgo <= 0) return 'now';
+                            if (secondsAgo === 1) return '1s ago';
+                            return `${secondsAgo}s ago`;
                         });
                         
                         const normalTraffic = data.map(d => d.prediction === 0 ? 1 : 0);
                         const attackTraffic = data.map(d => d.prediction > 0 ? 1 : 0);
                         
+                        // Update chart with real-time data
                         trafficChart.data.labels = labels;
                         trafficChart.data.datasets[0].data = normalTraffic;
                         trafficChart.data.datasets[1].data = attackTraffic;
-                        trafficChart.update();
+                        trafficChart.update('none'); // 'none' mode for smoother real-time updates
                     } else {
-                        // No data in last minute, clear chart
+                        // No real-time data, clear chart
                         trafficChart.data.labels = [];
                         trafficChart.data.datasets[0].data = [];
                         trafficChart.data.datasets[1].data = [];
-                        trafficChart.update();
+                        trafficChart.update('none');
                     }
                 })
                 .catch(error => console.error('Error fetching traffic:', error));
@@ -1611,15 +1612,19 @@ def get_stats():
 
 @app.route('/api/traffic')
 def get_traffic():
-    """Get traffic data from the last 1 minute only"""
+    """Get real-time traffic data from the last 30 seconds only"""
     current_time = time.time()
-    one_minute_ago = current_time - 60  # Last 60 seconds
+    thirty_seconds_ago = current_time - 30  # Last 30 seconds for real-time view
     
-    # Filter traffic buffer to only include data from last 1 minute
+    # Filter traffic buffer to only include data from last 30 seconds
     recent_traffic = [
         traffic for traffic in traffic_buffer 
-        if traffic.get('timestamp', 0) >= one_minute_ago
+        if traffic.get('timestamp', 0) >= thirty_seconds_ago
     ]
+    
+    # Sort by timestamp (oldest first) and limit to latest 30 data points max
+    recent_traffic.sort(key=lambda x: x.get('timestamp', 0))
+    recent_traffic = recent_traffic[-30:]  # Keep only last 30 data points
     
     return jsonify(recent_traffic)
 
