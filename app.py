@@ -138,10 +138,10 @@ blocked_ips = set()  # Keep in memory for quick lookups
 total_requests_count = 0  # Track total requests since startup
 
 # Detection thresholds and validation
-CONFIDENCE_THRESHOLD = 0.90  # Increased to 0.90 to further reduce false positives
-MIN_ATTACK_PROBABILITY = 0.85  # Minimum probability for attack class (increased)
-TIME_WINDOW_SECONDS = 10  # Time window for multiple detections (increased)
-MIN_DETECTIONS_IN_WINDOW = 3  # Require at least 3 detections in time window (increased)
+CONFIDENCE_THRESHOLD = 0.95  # Increased to 0.95 to reduce false positives
+MIN_ATTACK_PROBABILITY = 0.90  # Minimum probability for attack class (increased to 0.90)
+TIME_WINDOW_SECONDS = 15  # Time window for multiple detections (increased to 15 seconds)
+MIN_DETECTIONS_IN_WINDOW = 5  # Require at least 5 detections in time window (increased)
 
 # Test mode: Set to True to generate only normal traffic (no attacks) for testing false positives
 TEST_MODE_NORMAL_ONLY = False  # Set to False to enable attack simulation
@@ -435,7 +435,21 @@ def is_valid_attack_detection(traffic_data, features, attack_probability):
     if traffic_data['confidence'] < CONFIDENCE_THRESHOLD:
         return False
     
-    # Check 3: Feature validation - ensure features match expected attack patterns
+    # Check 3: First check if features are within normal ranges - if so, definitely false positive
+    packet_rate, byte_rate, syn_ratio, udp_ratio, dns_queries, connection_rate, payload_size, request_interval = features
+    
+    # If all features are within normal ranges, it's definitely a false positive
+    if (packet_rate <= NORMAL_TRAFFIC_RANGES['packet_rate'][1] and
+        byte_rate <= NORMAL_TRAFFIC_RANGES['byte_rate'][1] and
+        syn_ratio <= NORMAL_TRAFFIC_RANGES['syn_ratio'][1] and
+        udp_ratio <= NORMAL_TRAFFIC_RANGES['udp_ratio'][1] and
+        dns_queries <= NORMAL_TRAFFIC_RANGES['dns_queries'][1] and
+        connection_rate <= NORMAL_TRAFFIC_RANGES['connection_rate'][1] and
+        payload_size <= NORMAL_TRAFFIC_RANGES['payload_size'][1] and
+        request_interval <= NORMAL_TRAFFIC_RANGES['request_interval'][1]):
+        return False
+    
+    # Check 4: Feature validation - ensure features match expected attack patterns
     # If model predicts an attack but features don't match, it's likely a false positive
     feature_names_list = ['packet_rate', 'byte_rate', 'syn_ratio', 'udp_ratio', 
                          'dns_queries', 'connection_rate', 'payload_size', 'request_interval']
@@ -443,49 +457,51 @@ def is_valid_attack_detection(traffic_data, features, attack_probability):
     attack_type = traffic_data['attack_type']
     features_match_attack = False
     
-    # Check if features match what we'd expect for this attack type
+    # Check if features match what we'd expect for this attack type (stricter thresholds)
     for i, feature_name in enumerate(feature_names_list):
         feature_value = features[i]
         
-        # For each attack type, check if key features match expected patterns
+        # For each attack type, check if key features match expected patterns (with stricter thresholds)
         if attack_type == 'SYN_Flood':
-            if feature_name == 'syn_ratio' and feature_value > 0.5:
+            if feature_name == 'syn_ratio' and feature_value > 0.7:  # Increased from 0.5
                 features_match_attack = True
-            if feature_name == 'packet_rate' and feature_value > 300:
+            if feature_name == 'packet_rate' and feature_value > 500:  # Increased from 300
                 features_match_attack = True
         elif attack_type == 'HTTP_Flood':
-            if feature_name == 'packet_rate' and feature_value > 300:
+            if feature_name == 'packet_rate' and feature_value > 500:  # Increased from 300
                 features_match_attack = True
-            if feature_name == 'byte_rate' and feature_value > 100000:
+            if feature_name == 'byte_rate' and feature_value > 150000:  # Increased from 100000
                 features_match_attack = True
         elif attack_type == 'UDP_Flood':
-            if feature_name == 'udp_ratio' and feature_value > 0.5:
+            if feature_name == 'udp_ratio' and feature_value > 0.7:  # Increased from 0.5
                 features_match_attack = True
-            if feature_name == 'packet_rate' and feature_value > 300:
+            if feature_name == 'packet_rate' and feature_value > 500:  # Increased from 300
                 features_match_attack = True
         elif attack_type == 'DNS_Amplification':
-            if feature_name == 'dns_queries' and feature_value > 30:
+            if feature_name == 'dns_queries' and feature_value > 50:  # Increased from 30
                 features_match_attack = True
-            if feature_name == 'byte_rate' and feature_value > 100000:
+            if feature_name == 'byte_rate' and feature_value > 150000:  # Increased from 100000
                 features_match_attack = True
         elif attack_type == 'Slowloris':
-            if feature_name == 'request_interval' and feature_value > 2000:
+            if feature_name == 'request_interval' and feature_value > 3000:  # Increased from 2000
                 features_match_attack = True
-            if feature_name == 'connection_rate' and feature_value > 15:
+            if feature_name == 'connection_rate' and feature_value > 20:  # Increased from 15
                 features_match_attack = True
     
     # If features don't match expected attack patterns, it's likely a false positive
     if not features_match_attack:
         return False
     
-    # Check 4: Time-window validation - require multiple detections
+    # Check 5: Time-window validation - require multiple detections
     current_time = traffic_data['timestamp']
     # Count previous detections (excluding current one) of the same attack type
+    # Also check that they passed validation (have similar high confidence)
     recent_attacks = [
         t for t in traffic_buffer 
         if t['prediction'] == traffic_data['prediction'] 
         and t['timestamp'] < current_time  # Exclude current detection
         and (current_time - t['timestamp']) <= TIME_WINDOW_SECONDS
+        and t.get('confidence', 0) >= CONFIDENCE_THRESHOLD  # Must also have high confidence
     ]
     
     # Require at least MIN_DETECTIONS_IN_WINDOW previous detections before alerting
