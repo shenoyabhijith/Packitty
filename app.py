@@ -1496,7 +1496,8 @@ dashboard_template = '''
                         return;
                     }
                     
-                    container.innerHTML = data.slice(-10).reverse().map(alert => {
+                    // Data is already sorted DESC from API, just take latest 10
+                    container.innerHTML = data.slice(0, 10).map(alert => {
                         const time = new Date(alert.timestamp * 1000).toLocaleTimeString();
                         const severityClass = `alert-${alert.severity}`;
                         const actionClass = `action-${alert.mitigation_action || 'PENDING'}`;
