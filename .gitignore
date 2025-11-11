@@ -1,0 +1,134 @@
+# Environment variables
+.env
+.env.example
+.env.local
+.env.*.local
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+venv/
+ENV/
+env/
+.venv
+
+# ML Models and Data
+*.pkl
+*.h5
+*.model
+*.joblib
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.tflite
+*.pb
+*.hdf5
+*.weights
+*.bin
+*.index
+*.data-*
+
+# Logs
+*.log
+*.log.*
+logs/
+ml_model_output.log
+*.out
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+._*
+.project
+.pydevproject
+.settings/
+*.sublime-project
+*.sublime-workspace
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+desktop.ini
+
+# Archives and backups
+*.tar.gz
+*.zip
+*.rar
+*.7z
+*.gz
+*.bz2
+packitty-deploy.tar.gz
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.backup
+*.swp
+*.swo
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Lock files (optional - uncomment if you want to ignore)
+# uv.lock
+# poetry.lock
+# Pipfile.lock
+
+# Coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+.pytest_cache/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Pyre type checker
+.pyre/

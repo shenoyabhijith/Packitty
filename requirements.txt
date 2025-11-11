@@ -1,0 +1,10 @@
+flask
+scikit-learn
+joblib
+numpy
+litellm
+pandas
+matplotlib
+seaborn
+requests
+python-dotenv
