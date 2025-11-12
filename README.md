@@ -1,4 +1,7 @@
-# DDOS Shield - Real-time Detection & Mitigation System
+# Packitty Real-time Detection & Mitigation System
+
+<img width="3190" height="7823" alt="Packitty-website-mockup" src="https://github.com/user-attachments/assets/35a6b8b7-128c-49e2-850e-3dea7c486d32" />
+
 
 A comprehensive ML-powered DDOS detection and automated mitigation system with real-time monitoring dashboard.
 
