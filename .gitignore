@@ -102,6 +102,7 @@ packitty-deploy.tar.gz
 *.backup
 *.swp
 *.swo
+*.pid
 
 # Database
 *.db

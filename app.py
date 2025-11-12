@@ -20,8 +20,19 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Reduce werkzeug (Flask) logging verbosity for API requests
-logging.getLogger('werkzeug').setLevel(logging.WARNING)
+# Custom filter to suppress 400 Bad Request errors from scanners/bots
+class SuppressBadRequestFilter(logging.Filter):
+    def filter(self, record):
+        # Suppress werkzeug 400 errors (malformed requests from scanners)
+        if 'werkzeug' in record.name:
+            if 'code 400' in str(record.getMessage()) or 'Bad request' in str(record.getMessage()):
+                return False
+        return True
+
+# Apply filter to werkzeug logger
+werkzeug_logger = logging.getLogger('werkzeug')
+werkzeug_logger.addFilter(SuppressBadRequestFilter())
+werkzeug_logger.setLevel(logging.ERROR)  # Only log errors, suppress warnings and 400 bad requests
 
 # Import AI Agent module
 try:
@@ -65,6 +76,12 @@ def initialize_ml_log_file():
 
 app = Flask(__name__)
 
+# Suppress 400 Bad Request errors from malformed requests (scanners/bots)
+@app.errorhandler(400)
+def handle_bad_request(e):
+    """Silently handle 400 Bad Request errors to reduce log noise from scanners"""
+    return '', 400
+
 # Database configuration
 DB_PATH = os.getenv('DB_PATH', 'packitty.db')
 
@@ -103,12 +120,19 @@ def init_database():
             command TEXT,
             status TEXT NOT NULL,
             source_ip TEXT NOT NULL,
+            attack_type TEXT,
             reasoning TEXT,
             ai_powered INTEGER DEFAULT 0,
             created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (alert_id) REFERENCES alerts(id)
         )
     ''')
+    
+    # Add attack_type column if it doesn't exist (migration for existing databases)
+    try:
+        cursor.execute('ALTER TABLE mitigation_history ADD COLUMN attack_type TEXT')
+    except sqlite3.OperationalError:
+        pass  # Column already exists
     
     # Create stats table to track total requests
     cursor.execute('''
@@ -161,7 +185,7 @@ TIME_WINDOW_SECONDS = 15  # Time window for multiple detections (increased to 15
 MIN_DETECTIONS_IN_WINDOW = 5  # Require at least 5 detections in time window (increased)
 
 # Test mode: Set to True to generate only normal traffic (no attacks) for testing false positives
-TEST_MODE_NORMAL_ONLY = False  # Set to False to enable attack simulation
+TEST_MODE_NORMAL_ONLY = True  # Only generate normal traffic; attacks via manual trigger only
 
 # Normal traffic feature ranges (to filter outliers)
 NORMAL_TRAFFIC_RANGES = {
@@ -383,7 +407,8 @@ def simulate_network_traffic():
         if TEST_MODE_NORMAL_ONLY:
             traffic_type = 0  # Only normal traffic
         else:
-            traffic_type = np.random.choice([0, 1, 2, 3, 4, 5], p=[0.7, 0.06, 0.06, 0.06, 0.06, 0.06])
+            # Reduced attack probability: 95% normal, 1% per attack type (5% total attacks)
+            traffic_type = np.random.choice([0, 1, 2, 3, 4, 5], p=[0.95, 0.01, 0.01, 0.01, 0.01, 0.01])
         
         if traffic_type == 0:  # Normal traffic
             features = np.random.normal(
@@ -452,14 +477,32 @@ def simulate_network_traffic():
                 create_alert(traffic_data, features)
                 triggered_alert = True
             else:
-                logger.info(f"False positive filtered: {ATTACK_TYPES[prediction]} "
-                           f"(confidence: {max_confidence:.3f}, attack_prob: {attack_probability:.3f}, "
-                           f"features: packet_rate={features[0]:.1f}, udp_ratio={features[3]:.3f})")
+                # Only log false positive if this attack type appears in recent alerts
+                if has_recent_alerts_for_attack_type(ATTACK_TYPES[prediction]):
+                    logger.info(f"False positive filtered: {ATTACK_TYPES[prediction]} "
+                               f"(confidence: {max_confidence:.3f}, attack_prob: {attack_probability:.3f}, "
+                               f"features: packet_rate={features[0]:.1f}, udp_ratio={features[3]:.3f})")
         
         # Log ML model output to file
         log_ml_prediction(features, prediction, probabilities, traffic_data, triggered_alert)
         
         time.sleep(1)  # Simulate 1 second intervals
+
+def has_recent_alerts_for_attack_type(attack_type, time_window=60):
+    """Check if there are any recent alerts for the given attack type (within last 60 seconds)"""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    current_time = time.time()
+    time_threshold = current_time - time_window
+    
+    cursor.execute('''
+        SELECT COUNT(*) FROM alerts 
+        WHERE attack_type = ? AND timestamp >= ?
+    ''', (attack_type, time_threshold))
+    
+    count = cursor.fetchone()[0]
+    conn.close()
+    return count > 0
 
 def is_valid_attack_detection(traffic_data, features, attack_probability):
     """
@@ -695,7 +738,6 @@ def execute_mitigation(alert):
         actual_command = recommendation.get('ufw_command', f'sudo ufw {action.lower().replace("_", " ")} from {source_ip}')
         ufw_command = f"{actual_command} (EXECUTED via AI tool calling)"
         if action != 'MONITOR':
-            blocked_ips.add(source_ip)
             status = 'MITIGATED'
         else:
             status = 'MONITORING'
@@ -712,7 +754,6 @@ def execute_mitigation(alert):
             else:
                 ufw_command = f"{ufw_command} (EXECUTED)"
             if ufw_result.get('success'):
-                blocked_ips.add(source_ip)
                 status = 'MITIGATED'
             else:
                 status = 'FAILED'
@@ -725,7 +766,6 @@ def execute_mitigation(alert):
             else:
                 ufw_command = f"{ufw_command} (EXECUTED)"
             if ufw_result.get('success'):
-                blocked_ips.add(source_ip)
                 status = 'MITIGATED'
             else:
                 status = 'FAILED'
@@ -738,8 +778,8 @@ def execute_mitigation(alert):
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO mitigation_history 
-        (timestamp, alert_id, action, command, status, source_ip, reasoning, ai_powered)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        (timestamp, alert_id, action, command, status, source_ip, attack_type, reasoning, ai_powered)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (
         time.time(),
         alert['id'],
@@ -747,6 +787,7 @@ def execute_mitigation(alert):
         ufw_command,
         status,
         source_ip,
+        attack_type,
         reasoning if use_ai else 'Rule-based decision',
         1 if use_ai else 0
     ))
@@ -827,6 +868,9 @@ dashboard_template = '''
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>DDOS Shield - Real-time Detection & Mitigation</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:ital,wght@0,100;0,200;0,300;0,400;0,500;0,600;0,700;0,800;0,900;1,100;1,200;1,300;1,400;1,500;1,600;1,700;1,800;1,900&family=Space+Mono:ital,wght@0,400;0,700;1,400;1,700&display=swap" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
     <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
     <style>
@@ -837,111 +881,163 @@ dashboard_template = '''
         }
         
         body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #0f172a 0%, #1e293b 100%);
+            font-family: 'Poppins', -apple-system, BlinkMacSystemFont, 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            font-weight: 200;
+            background: radial-gradient(ellipse at bottom, #5091DD 0%, #030617 100%);
             color: #e2e8f0;
             line-height: 1.6;
             min-height: 100vh;
+            height: 100%;
+            position: relative;
+            overflow-x: hidden;
         }
+        
+        /* Grid pattern overlay */
+        #grid {
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 1px;
+            pointer-events: none;
+            z-index: 0;
+        }
+        
         
         .container {
             max-width: 1400px;
             margin: 0 auto;
-            padding: 20px;
+            padding: 30px 20px;
+            position: relative;
+            z-index: 1;
         }
         
         .header {
             text-align: center;
-            padding: 30px 0;
+            padding: 30px 0 40px;
             background: rgba(30, 41, 59, 0.5);
-            border-radius: 15px;
-            margin-bottom: 30px;
+            border-radius: 16px;
+            margin-bottom: 40px;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 20px;
         }
         
         .header h1 {
-            font-size: 3em;
-            margin-bottom: 10px;
+            font-size: 40px;
+            font-weight: 700;
+            margin-bottom: 15px;
             background: linear-gradient(135deg, #3b82f6 0%, #8b5cf6 100%);
             -webkit-background-clip: text;
             -webkit-text-fill-color: transparent;
             background-clip: text;
+            letter-spacing: 2px;
         }
         
         .header p {
-            font-size: 1.2em;
+            font-size: 1.05em;
             color: #94a3b8;
+            margin: 0;
+            padding: 20px 0 0 0;
+        }
+        
+        .section-divider {
+            height: 1px;
+            background: rgba(255, 255, 255, 0.1);
+            margin: 40px 0;
+            border: none;
         }
         
         .stats-grid {
             display: grid;
             grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 25px;
+            margin-bottom: 40px;
         }
         
         .stat-card {
-            background: rgba(30, 41, 59, 0.8);
-            padding: 25px;
-            border-radius: 15px;
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.8) 100%);
+            padding: 30px 25px;
+            border-radius: 16px;
             text-align: center;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
             transition: transform 0.3s ease, box-shadow 0.3s ease;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
         
         .stat-card:hover {
             transform: translateY(-5px);
-            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
         }
         
         .stat-value {
             font-size: 2.5em;
-            font-weight: bold;
-            margin-bottom: 10px;
+            font-weight: 700;
+            margin-bottom: 12px;
+            text-shadow: 0 0 20px currentColor;
         }
         
-        .stat-value.high { color: #ef4444; }
-        .stat-value.medium { color: #f59e0b; }
-        .stat-value.low { color: #10b981; }
-        .stat-value.info { color: #3b82f6; }
+        .stat-value.high { 
+            color: #ff6b6b;
+            text-shadow: 0 0 20px rgba(239, 68, 68, 0.6);
+        }
+        .stat-value.medium { 
+            color: #ffd93d;
+            text-shadow: 0 0 20px rgba(245, 158, 11, 0.6);
+        }
+        .stat-value.low { 
+            color: #6bcf7f;
+            text-shadow: 0 0 20px rgba(16, 185, 129, 0.6);
+        }
+        .stat-value.info { 
+            color: #6b9fff;
+            text-shadow: 0 0 20px rgba(59, 130, 246, 0.6);
+        }
         
         .stat-label {
-            color: #94a3b8;
+            color: #cbd5e1;
             font-size: 1.1em;
             text-transform: uppercase;
-            letter-spacing: 1px;
+            letter-spacing: 1.5px;
+            font-weight: 500;
         }
         
         .charts-grid {
             display: grid;
             grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-bottom: 30px;
+            gap: 25px;
+            margin-bottom: 40px;
         }
         
         .chart-container {
-            background: rgba(30, 41, 59, 0.8);
-            padding: 25px;
-            border-radius: 15px;
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.8) 100%);
+            padding: 30px;
+            border-radius: 16px;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
         
         .chart-container h3 {
-            margin-bottom: 20px;
+            margin-bottom: 25px;
             color: #e2e8f0;
             font-size: 1.3em;
+            font-weight: 600;
         }
         
         .alerts-section {
-            background: rgba(30, 41, 59, 0.8);
-            padding: 25px;
-            border-radius: 15px;
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.8) 100%);
+            padding: 30px;
+            border-radius: 16px;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.1);
-            margin-bottom: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 40px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
         
         .alerts-section h3 {
@@ -1038,6 +1134,19 @@ dashboard_template = '''
             color: white;
             text-transform: uppercase;
             letter-spacing: 0.5px;
+            animation: pulseGlow 2s ease-in-out infinite;
+            box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+        }
+        
+        @keyframes pulseGlow {
+            0%, 100% { 
+                box-shadow: 0 0 15px rgba(139, 92, 246, 0.5);
+                transform: scale(1);
+            }
+            50% { 
+                box-shadow: 0 0 25px rgba(139, 92, 246, 0.8);
+                transform: scale(1.05);
+            }
         }
         
         .ai-reasoning {
@@ -1062,24 +1171,42 @@ dashboard_template = '''
             height: 12px;
             border-radius: 50%;
             margin-right: 8px;
+            box-shadow: 0 0 8px currentColor;
         }
         
-        .status-MITIGATED { background: #10b981; }
-        .status-DETECTED { background: #f59e0b; animation: pulse 2s infinite; }
-        .status-FAILED { background: #ef4444; }
+        .status-MITIGATED { 
+            background: #10b981;
+            box-shadow: 0 0 8px rgba(16, 185, 129, 0.6);
+        }
+        .status-DETECTED { 
+            background: #f59e0b;
+            animation: pulse 2s infinite;
+            box-shadow: 0 0 8px rgba(245, 158, 11, 0.6);
+        }
+        .status-FAILED { 
+            background: #ef4444;
+            box-shadow: 0 0 8px rgba(239, 68, 68, 0.6);
+        }
         
         @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            0%, 100% { 
+                opacity: 1;
+                transform: scale(1);
+            }
+            50% { 
+                opacity: 0.7;
+                transform: scale(1.2);
+            }
         }
         
         .system-status {
             text-align: center;
-            padding: 15px;
+            padding: 18px;
             background: rgba(16, 185, 129, 0.1);
             border: 1px solid rgba(16, 185, 129, 0.3);
-            border-radius: 10px;
-            margin-top: 20px;
+            border-radius: 12px;
+            margin-top: 30px;
+            position: relative;
         }
         
         .system-status.active {
@@ -1088,13 +1215,28 @@ dashboard_template = '''
             color: #10b981;
         }
         
+        .system-status.active::before {
+            content: '';
+            position: absolute;
+            left: 20px;
+            top: 50%;
+            transform: translateY(-50%);
+            width: 10px;
+            height: 10px;
+            background: #10b981;
+            border-radius: 50%;
+            box-shadow: 0 0 10px rgba(16, 185, 129, 0.8);
+            animation: pulse 2s infinite;
+        }
+        
         .attack-generator {
-            background: rgba(30, 41, 59, 0.8);
-            padding: 25px;
-            border-radius: 15px;
+            background: linear-gradient(135deg, rgba(30, 41, 59, 0.9) 0%, rgba(15, 23, 42, 0.8) 100%);
+            padding: 30px;
+            border-radius: 16px;
             backdrop-filter: blur(10px);
-            border: 1px solid rgba(148, 163, 184, 0.1);
-            margin-bottom: 30px;
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            margin-bottom: 40px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
         }
         
         .attack-generator h3 {
@@ -1103,35 +1245,70 @@ dashboard_template = '''
             font-size: 1.3em;
             display: flex;
             align-items: center;
+            justify-content: space-between;
             gap: 10px;
         }
         
-        .attack-buttons {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 15px;
-            margin-top: 20px;
-        }
-        
-        .attack-btn {
-            padding: 15px 20px;
+        .reset-btn {
+            padding: 8px 16px;
             border: none;
-            border-radius: 10px;
-            font-size: 1em;
+            border-radius: 8px;
+            font-size: 0.85em;
             font-weight: bold;
             cursor: pointer;
             transition: all 0.3s ease;
             display: flex;
             align-items: center;
-            justify-content: center;
-            gap: 10px;
+            gap: 6px;
+            background: linear-gradient(135deg, #64748b 0%, #475569 100%);
+            color: white;
             text-transform: uppercase;
             letter-spacing: 0.5px;
         }
         
+        .reset-btn:hover {
+            background: linear-gradient(135deg, #ef4444 0%, #dc2626 100%);
+            transform: translateY(-2px);
+            box-shadow: 0 5px 15px rgba(239, 68, 68, 0.3);
+        }
+        
+        .reset-btn:active {
+            transform: translateY(0);
+        }
+        
+        .attack-buttons {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+            gap: 15px;
+            margin-top: 25px;
+        }
+        
+        .attack-btn {
+            padding: 16px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 0.95em;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 12px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);
+            min-height: 50px;
+        }
+        
+        .attack-btn i {
+            font-size: 1.1em;
+        }
+        
         .attack-btn:hover {
             transform: translateY(-2px);
-            box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.4);
+            filter: brightness(1.1);
         }
         
         .attack-btn:active {
@@ -1144,22 +1321,22 @@ dashboard_template = '''
         }
         
         .attack-btn.http-flood {
-            background: linear-gradient(135deg, #dc2626 0%, #b91c1c 100%);
+            background: linear-gradient(135deg, #8b5cf6 0%, #7c3aed 100%);
             color: white;
         }
         
         .attack-btn.udp-flood {
-            background: linear-gradient(135deg, #ea580c 0%, #c2410c 100%);
+            background: linear-gradient(135deg, #f59e0b 0%, #d97706 100%);
             color: white;
         }
         
         .attack-btn.slowloris {
-            background: linear-gradient(135deg, #d97706 0%, #b45309 100%);
+            background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
             color: white;
         }
         
         .attack-btn.dns-amplification {
-            background: linear-gradient(135deg, #b91c1c 0%, #991b1b 100%);
+            background: linear-gradient(135deg, #ec4899 0%, #db2777 100%);
             color: white;
         }
         
@@ -1202,21 +1379,297 @@ dashboard_template = '''
             }
             
             .header h1 {
-                font-size: 2em;
+                font-size: 32px;
             }
             
             .container {
                 padding: 10px;
             }
         }
+        
+        /* Cat Logo Styles */
+        .cat.container {
+            position: relative;
+            background-color: transparent;
+            height: 120px;
+            width: 150px;
+            z-index: 1;
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        .cat.head {
+            position: absolute;
+            background-color: #f3f3f3;
+            top: 50%;
+            left: 50%;
+            border: 2px solid black;
+            height: 108px;
+            width: 126px;
+            border-radius: 60% 60% 50% 50%;
+            transform: translate(-50%, -50%);
+        }
+        
+        .cat.ears {
+            position: absolute;
+            background-color: pink;
+            top: 50%;
+            left: 50%;
+        }
+        
+        .cat.ears::before {
+            content: "";
+            position: absolute;
+            background-color: pink;
+            margin-left: -21px;
+            border: 2px solid black;
+            height: 90px;
+            width: 90px;
+            background-clip: content-box;
+            box-shadow: inset 0 0 0 9px #f3f3f3;
+            border-radius: 5px 90% 0 90%;
+            transform: skewX(10deg);
+            transform: skewY(10deg);
+            transform: translate(-50%, -65%);
+        }
+        
+        .cat.ears::after {
+            content: "";
+            position: absolute;
+            background-color: pink;
+            margin-left: 21px;
+            border: 2px solid black;
+            height: 90px;
+            width: 90px;
+            background-clip: content-box;
+            box-shadow: inset 0 0 0 9px #f3f3f3;
+            border-radius: 90% 5px 90% 0;
+            transform: skewX(-10deg);
+            transform: skewY(-10deg);
+            transform: translate(-50%, -65%);
+        }
+        
+        .cat.face {
+            position: absolute;
+            background-color: #fff;
+            top: 60%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            height: 54px;
+            width: 60px;
+            border-radius: 50%;
+        }
+        
+        .cat.eyes {
+            position: relative;
+            background-color: transparent;
+            top: 20%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            height: 18px;
+            width: 18px;
+            border-radius: 50%;
+            box-shadow: -30px 6px 0 #000, 30px 6px 0 #000;
+        }
+        
+        .cat.nose {
+            position: relative;
+            background-color: pink;
+            top: 20%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            height: 6px;
+            width: 9px;
+            border-radius: 50%;
+        }
+        
+        .cat.mouth {
+            position: relative;
+            top: 30%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            height: 4px;
+            width: 8px;
+        }
+        
+        .cat.mouth::before {
+            content: "";
+            position: absolute;
+            left: 0px;
+            transform: translate(-50%, -50%);
+            border: 2px solid black;
+            height: 4px;
+            width: 8px;
+            border-radius: 0 0 125px 125px;
+            border-top: none;
+        }
+        
+        .cat.mouth::after {
+            content: "";
+            position: absolute;
+            left: 9px;
+            transform: translate(-50%, -50%);
+            border: 2px solid black;
+            height: 4px;
+            width: 8px;
+            border-radius: 0 0 125px 125px;
+            border-top: none;
+        }
+        
+        .cat.body {
+            position: absolute;
+            background-color: #f3f3f3;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, 70%);
+            border: 2px solid black;
+            height: 54px;
+            width: 54px;
+            border-radius: 50% 50% 25px 25px;
+            z-index: -1;
+        }
+        
+        .cat.body::before {
+            content: "";
+            position: absolute;
+            background-color: #fff;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -80%);
+            height: 36px;
+            width: 36px;
+            z-index: 3;
+            border-radius: 50%;
+            border-top: none;
+        }
+        
+        .cat.frontleg {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            margin: 81px 0 0 0;
+            transform: translate(-50%, -50%);
+            width: 12px;
+        }
+        
+        .cat.frontleg::before {
+            content: "";
+            position: absolute;
+            background-color: #f3f3f3;
+            left: -90%;
+            height: 18px;
+            width: 12px;
+            border: 2px solid black;
+            border-radius: 0 0 50% 50%;
+            border-top: none;
+        }
+        
+        .cat.frontleg::after {
+            content: "";
+            position: absolute;
+            background-color: #f3f3f3;
+            left: 90%;
+            height: 18px;
+            width: 12px;
+            border: 2px solid black;
+            border-radius: 0 0 50% 50%;
+            border-top: none;
+        }
+        
+        .cat.backleg {
+            position: absolute;
+            background-color: #f3f3f3;
+            top: 50%;
+            left: 50%;
+            margin: 92px 0 0 0;
+            z-index: -2;
+        }
+        
+        .cat.backleg::before {
+            content: "";
+            position: absolute;
+            background-color: #f3f3f3;
+            top: -6px;
+            left: -36px;
+            width: 7px;
+            height: 7px;
+            border: 2px solid black;
+            border-radius: 50% 0 0 50%;
+            transform: skewX(-10deg);
+            transform: skewY(-10deg);
+        }
+        
+        .cat.backleg::after {
+            content: "";
+            position: absolute;
+            background-color: #f3f3f3;
+            top: -6px;
+            left: 24px;
+            width: 7px;
+            height: 7px;
+            border: 2px solid black;
+            border-radius: 0 50% 50% 0;
+            transform: skewX(10deg);
+            transform: skewY(10deg);
+        }
+        
+        .cat.tail {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            margin: 78px 0 0 -54px;
+            z-index: -2;
+        }
+        
+        .cat.tail::before {
+            content: "";
+            position: absolute;
+            background-color: #f3f3f3;
+            width: 25px;
+            height: 7px;
+            border: 2px solid black;
+            border-radius: 30px 0 0 50px;
+            transform: rotate(50deg);
+            transform-origin: right center;
+        }
+        
+        .cat.tail::after {
+            content: "";
+            position: absolute;
+            background-color: #fff;
+            margin: -12px 0 0 11px;
+            width: 7px;
+            height: 7px;
+            border-radius: 30px 0 0 50px;
+            transform: rotate(50deg);
+            transform-origin: right center;
+        }
     </style>
 </head>
 <body>
+    <div id="grid"></div>
     <div class="container">
         <div class="header">
-            <h1><i class="fas fa-shield-alt"></i> DDOS Shield</h1>
-            <p>Real-time ML-Powered Threat Detection & Automated Mitigation</p>
+            <div class="cat container">
+                <div class="cat ears"></div>
+                <div class="cat head">
+                    <div class="cat face">
+                        <div class="cat eyes"></div>
+                        <div class="cat nose"></div>
+                        <div class="cat mouth"></div>
+                    </div>
+                </div>
+                <div class="cat body"></div>
+                <div class="cat frontleg"></div>
+                <div class="cat backleg"></div>
+                <div class="cat tail"></div>
+            </div>
+            <p>Packitty a Real-time ML-Powered Threat Detection & Automated Mitigation</p>
         </div>
+        
+        <hr class="section-divider">
         
         <div class="stats-grid">
             <div class="stat-card">
@@ -1235,11 +1688,13 @@ dashboard_template = '''
                 <div class="stat-value low" id="mitigation-rate">0</div>
                 <div class="stat-label">Mitigations</div>
             </div>
-            <div class="stat-card">
-                <div class="stat-value" id="ai-mitigations" style="color: #8b5cf6;">0</div>
+            <div class="stat-card" style="position: relative;">
+                <div class="stat-value" id="ai-mitigations" style="color: #8b5cf6; text-shadow: 0 0 20px rgba(139, 92, 246, 0.6);">0</div>
                 <div class="stat-label"><i class="fas fa-robot"></i> AI-Powered</div>
             </div>
         </div>
+        
+        <hr class="section-divider">
         
         <div class="charts-grid">
             <div class="chart-container">
@@ -1252,8 +1707,15 @@ dashboard_template = '''
             </div>
         </div>
         
+        <hr class="section-divider">
+        
         <div class="attack-generator">
-            <h3><i class="fas fa-bomb"></i> Attack Generator (Testing Mode)</h3>
+            <h3>
+                <span><i class="fas fa-bomb"></i> Attack Generator (Testing Mode)</span>
+                <button class="reset-btn" onclick="resetStats()" title="Reset all dashboard stats">
+                    <i class="fas fa-redo"></i> Reset
+                </button>
+            </h3>
             <p style="color: #94a3b8; margin-bottom: 15px;">Manually trigger attacks to test the detection system</p>
             <div class="attack-buttons">
                 <button class="attack-btn syn-flood" onclick="triggerAttack('SYN_Flood')">
@@ -1275,6 +1737,8 @@ dashboard_template = '''
             <div id="attack-status" class="attack-status"></div>
         </div>
         
+        <hr class="section-divider">
+        
         <div class="alerts-section">
             <h3><i class="fas fa-exclamation-triangle"></i> Recent Alerts</h3>
             <div id="alerts-container">
@@ -1285,7 +1749,9 @@ dashboard_template = '''
             </div>
         </div>
         
-        <div class="ai-agent-status" style="background: rgba(139, 92, 246, 0.1); border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 10px; padding: 15px; margin-bottom: 20px;">
+        <hr class="section-divider">
+        
+        <div class="ai-agent-status" style="background: linear-gradient(135deg, rgba(139, 92, 246, 0.15) 0%, rgba(99, 102, 241, 0.1) 100%); border: 1px solid rgba(139, 92, 246, 0.3); border-radius: 16px; padding: 25px; margin-bottom: 30px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3);">
             <h3 style="color: #a78bfa; margin-bottom: 15px; display: flex; align-items: center; justify-content: center; gap: 10px;">
                 <i class="fas fa-robot"></i> AI Agent Status
             </h3>
@@ -1298,7 +1764,7 @@ dashboard_template = '''
                 </h4>
                 <div id="ai-decisions-list" style="max-height: 300px; overflow-y: auto;">
                     <div style="text-align: center; padding: 20px; color: #94a3b8; font-size: 0.9em;">
-                        <i class="fas fa-clock"></i> Waiting for AI decisions...
+                        <i class="fas fa-spinner fa-spin" style="margin-right: 8px;"></i> Waiting for AI decisions...
                     </div>
                 </div>
             </div>
@@ -1312,6 +1778,51 @@ dashboard_template = '''
     </div>
     
     <script>
+        // Generate grid pattern dynamically
+        function generateGridPattern() {
+            const grid = document.getElementById('grid');
+            if (!grid) return;
+            
+            const lineColor = '#030617';
+            const step = 3;
+            const viewportHeight = Math.max(document.documentElement.clientHeight, window.innerHeight || 0);
+            const viewportWidth = Math.max(document.documentElement.clientWidth, window.innerWidth || 0);
+            const numHorizontalLines = Math.ceil(viewportHeight / step);
+            const numVerticalLines = Math.ceil(viewportWidth / step);
+            
+            // Generate horizontal lines (vertical box-shadow)
+            let horizontalShadows = '0px 0px ' + lineColor;
+            for (let i = 1; i <= numHorizontalLines; i++) {
+                horizontalShadows += ', 0px ' + (step * i) + 'px ' + lineColor;
+            }
+            grid.style.boxShadow = horizontalShadows;
+            
+            // Generate vertical lines (horizontal box-shadow)
+            let verticalShadows = '0px 0px ' + lineColor;
+            for (let i = 1; i <= numVerticalLines; i++) {
+                verticalShadows += ', ' + (step * i) + 'px 0px ' + lineColor;
+            }
+            
+            // Create pseudo-element for vertical lines
+            const style = document.createElement('style');
+            style.textContent = `
+                #grid::after {
+                    content: "";
+                    position: absolute;
+                    top: 0;
+                    left: 0;
+                    width: 1px;
+                    height: 100%;
+                    box-shadow: ${verticalShadows};
+                }
+            `;
+            document.head.appendChild(style);
+        }
+        
+        // Generate grid on load and resize
+        window.addEventListener('load', generateGridPattern);
+        window.addEventListener('resize', generateGridPattern);
+        
         // Chart configurations
         const chartColors = {
             primary: '#3b82f6',
@@ -1322,6 +1833,15 @@ dashboard_template = '''
             info: '#06b6d4'
         };
         
+        // Attack type colors - matching button colors
+        const attackColors = {
+            'SYN_Flood': '#ef4444',        // Red - matches syn-flood button
+            'HTTP_Flood': '#8b5cf6',       // Purple - matches http-flood button
+            'UDP_Flood': '#f59e0b',        // Orange/Amber - matches udp-flood button
+            'Slowloris': '#06b6d4',        // Cyan - matches slowloris button
+            'DNS_Amplification': '#ec4899' // Pink - matches dns-amplification button
+        };
+        
         // Initialize traffic chart
         const trafficCtx = document.getElementById('trafficChart').getContext('2d');
         const trafficChart = new Chart(trafficCtx, {
@@ -1329,37 +1849,96 @@ dashboard_template = '''
             data: {
                 labels: [],
                 datasets: [{
-                    label: 'Normal Traffic',
+                    label: 'Normal Traffic (Packets/sec)',
                     data: [],
                     borderColor: chartColors.success,
                     backgroundColor: chartColors.success + '20',
                     tension: 0.4,
-                    fill: true
+                    fill: true,
+                    borderWidth: 3
                 }, {
-                    label: 'Attack Traffic',
+                    label: 'Attack Traffic (Packets/sec)',
                     data: [],
                     borderColor: chartColors.danger,
                     backgroundColor: chartColors.danger + '20',
                     tension: 0.4,
-                    fill: true
+                    fill: true,
+                    borderWidth: 3
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                interaction: {
+                    intersect: false,
+                    mode: 'index'
+                },
                 plugins: {
                     legend: {
-                        labels: { color: '#e2e8f0' }
+                        labels: { 
+                            color: '#e2e8f0',
+                            font: { size: 12, weight: '500' }
+                        }
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                        titleColor: '#e2e8f0',
+                        bodyColor: '#cbd5e1',
+                        borderColor: 'rgba(148, 163, 184, 0.2)',
+                        borderWidth: 1,
+                        padding: 12,
+                        displayColors: true,
+                        callbacks: {
+                            label: function(context) {
+                                return context.dataset.label + ': ' + context.parsed.y + ' packets/sec';
+                            }
+                        }
                     }
                 },
                 scales: {
                     x: {
-                        ticks: { color: '#94a3b8' },
-                        grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        ticks: { 
+                            color: '#94a3b8',
+                            font: { size: 11 }
+                        },
+                        grid: { 
+                            color: 'rgba(148, 163, 184, 0.15)',
+                            lineWidth: 1
+                        },
+                        title: {
+                            display: true,
+                            text: 'Time',
+                            color: '#94a3b8',
+                            font: { size: 12, weight: '500' }
+                        }
                     },
                     y: {
-                        ticks: { color: '#94a3b8' },
-                        grid: { color: 'rgba(148, 163, 184, 0.1)' }
+                        ticks: { 
+                            color: '#94a3b8',
+                            font: { size: 11 }
+                        },
+                        grid: { 
+                            color: 'rgba(148, 163, 184, 0.15)',
+                            lineWidth: 1
+                        },
+                        min: 0,
+                        max: 1000,
+                        title: {
+                            display: true,
+                            text: 'Packets/sec',
+                            color: '#94a3b8',
+                            font: { size: 12, weight: '500' }
+                        }
+                    }
+                },
+                elements: {
+                    line: {
+                        borderWidth: 3,
+                        tension: 0.4
+                    },
+                    point: {
+                        radius: 3,
+                        hoverRadius: 6
                     }
                 }
             }
@@ -1374,11 +1953,11 @@ dashboard_template = '''
                 datasets: [{
                     data: [0, 0, 0, 0, 0],
                     backgroundColor: [
-                        chartColors.danger,
-                        chartColors.danger,
-                        chartColors.warning,
-                        chartColors.warning,
-                        chartColors.danger
+                        attackColors['SYN_Flood'],        // Red
+                        attackColors['HTTP_Flood'],        // Purple
+                        attackColors['UDP_Flood'],         // Orange/Amber
+                        attackColors['Slowloris'],         // Cyan
+                        attackColors['DNS_Amplification']  // Pink
                     ],
                     borderWidth: 2,
                     borderColor: 'rgba(15, 23, 42, 0.8)'
@@ -1387,9 +1966,30 @@ dashboard_template = '''
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
+                interaction: {
+                    intersect: false
+                },
                 plugins: {
                     legend: {
-                        labels: { color: '#e2e8f0' }
+                        labels: { 
+                            color: '#e2e8f0',
+                            font: { size: 12, weight: '500' }
+                        }
+                    },
+                    tooltip: {
+                        backgroundColor: 'rgba(15, 23, 42, 0.95)',
+                        titleColor: '#e2e8f0',
+                        bodyColor: '#cbd5e1',
+                        borderColor: 'rgba(148, 163, 184, 0.2)',
+                        borderWidth: 1,
+                        padding: 12,
+                        callbacks: {
+                            label: function(context) {
+                                const label = context.label || '';
+                                const value = context.parsed || 0;
+                                return label + ': ' + value;
+                            }
+                        }
                     }
                 }
             }
@@ -1457,17 +2057,23 @@ dashboard_template = '''
                         const actionIcon = decision.action === 'BLOCK' ? 'fa-ban' : 
                                          decision.action === 'RATE_LIMIT' ? 'fa-tachometer-alt' : 'fa-eye';
                         
+                        const attackType = decision.attack_type || 'Unknown';
+                        const attackTypeColor = '#f59e0b';
+                        
                         return `
                             <div style="background: rgba(15, 23, 42, 0.6); padding: 12px; margin-bottom: 10px; border-radius: 8px; border-left: 3px solid ${actionColor};">
                                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
                                     <div style="display: flex; align-items: center; gap: 8px;">
                                         <i class="fas ${actionIcon}" style="color: ${actionColor};"></i>
-                                        <strong style="color: ${actionColor};">${decision.action}</strong>
+                                        <strong style="color: ${actionColor};">${decision.action} MITIGATED</strong>
                                         <span style="background: ${statusColor}; color: white; padding: 2px 8px; border-radius: 4px; font-size: 0.75em; font-weight: bold;">
                                             ${decision.status}
                                         </span>
                                     </div>
                                     <span style="color: #94a3b8; font-size: 0.85em;">${time}</span>
+                                </div>
+                                <div style="color: #cbd5e1; font-size: 0.9em; margin-bottom: 6px;">
+                                    <strong>Attack Type:</strong> <span style="color: ${attackTypeColor}; font-weight: bold;">${attackType}</span>
                                 </div>
                                 <div style="color: #cbd5e1; font-size: 0.9em; margin-bottom: 6px;">
                                     <strong>IP:</strong> ${decision.source_ip}
@@ -1494,7 +2100,7 @@ dashboard_template = '''
                 })
                 .catch(error => console.error('Error fetching mitigation history:', error));
             
-            // Update traffic chart (real-time: last 30 seconds only)
+            // Update traffic chart (real-time: last 20 seconds only)
             fetch('/api/traffic')
                 .then(response => response.json())
                 .then(data => {
@@ -1509,14 +2115,58 @@ dashboard_template = '''
                             return `${secondsAgo}s ago`;
                         });
                         
-                        const normalTraffic = data.map(d => d.prediction === 0 ? 1 : 0);
-                        const attackTraffic = data.map(d => d.prediction > 0 ? 1 : 0);
+                        // Extract packet_rate from features array (features[0] is packet_rate)
+                        // Clamp values to max 1000 to prevent chart breaking
+                        // Use 0 instead of null to maintain continuous lines
+                        const normalTraffic = data.map(d => {
+                            if (d.prediction === 0) {
+                                // Normal traffic - show actual packet rate
+                                if (d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                    const packetRate = Math.round(d.features[0] || 0);
+                                    return Math.min(packetRate, 1000); // Clamp to max 1000
+                                }
+                                return 0;
+                            }
+                            // During attacks, show 0 for normal traffic to maintain line continuity
+                            return 0;
+                        });
+                        const attackTraffic = data.map(d => {
+                            if (d.prediction > 0) {
+                                // Attack traffic - show actual packet rate
+                                if (d.features && Array.isArray(d.features) && d.features.length > 0) {
+                                    const packetRate = Math.round(d.features[0] || 0);
+                                    return Math.min(packetRate, 1000); // Clamp to max 1000
+                                }
+                                return 0;
+                            }
+                            // During normal traffic, show 0 for attack traffic to maintain line continuity
+                            return 0;
+                        });
+                        
+                        // Ensure labels and data arrays have same length
+                        if (labels.length !== normalTraffic.length || labels.length !== attackTraffic.length) {
+                            console.error('Chart data length mismatch:', {
+                                labels: labels.length,
+                                normal: normalTraffic.length,
+                                attack: attackTraffic.length
+                            });
+                            // Truncate to shortest length
+                            const minLength = Math.min(labels.length, normalTraffic.length, attackTraffic.length);
+                            labels.splice(minLength);
+                            normalTraffic.splice(minLength);
+                            attackTraffic.splice(minLength);
+                        }
                         
                         // Update chart with real-time data
-                        trafficChart.data.labels = labels;
-                        trafficChart.data.datasets[0].data = normalTraffic;
-                        trafficChart.data.datasets[1].data = attackTraffic;
-                        trafficChart.update('none'); // 'none' mode for smoother real-time updates
+                        try {
+                            trafficChart.data.labels = labels;
+                            trafficChart.data.datasets[0].data = normalTraffic;
+                            trafficChart.data.datasets[1].data = attackTraffic;
+                            // Use 'none' mode for smoother updates during attacks
+                            trafficChart.update('none');
+                        } catch (error) {
+                            console.error('Error updating traffic chart:', error);
+                        }
                     } else {
                         // No real-time data, clear chart
                         trafficChart.data.labels = [];
@@ -1548,8 +2198,18 @@ dashboard_template = '''
                         }
                         
                         // Update chart with only attack types (no Normal)
-                        attackChart.data.labels = attackTypes;
+                        // Map attack types to display labels
+                        const displayLabels = attackTypes.map(type => type.replace('_', ' '));
+                        attackChart.data.labels = displayLabels;
                         attackChart.data.datasets[0].data = attackCounts;
+                        // Ensure colors are maintained in correct order
+                        attackChart.data.datasets[0].backgroundColor = [
+                            attackColors['SYN_Flood'],
+                            attackColors['HTTP_Flood'],
+                            attackColors['UDP_Flood'],
+                            attackColors['Slowloris'],
+                            attackColors['DNS_Amplification']
+                        ];
                         attackChart.update();
                     } else {
                         // Hide chart container when no attacks
@@ -1608,6 +2268,51 @@ dashboard_template = '''
                     }).join('');
                 })
                 .catch(error => console.error('Error fetching alerts:', error));
+        }
+        
+        // Reset stats function
+        function resetStats() {
+            if (!confirm('Are you sure you want to reset all dashboard stats? This will clear all alerts, mitigation history, and reset counters.')) {
+                return;
+            }
+            
+            const statusDiv = document.getElementById('attack-status');
+            statusDiv.className = 'attack-status';
+            statusDiv.textContent = 'Resetting dashboard stats...';
+            statusDiv.classList.add('success');
+            
+            fetch('/api/reset-stats', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                }
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.success) {
+                    statusDiv.textContent = 'Dashboard stats reset successfully!';
+                    statusDiv.classList.remove('success');
+                    statusDiv.classList.add('success');
+                    // Refresh dashboard immediately
+                    setTimeout(updateDashboard, 300);
+                } else {
+                    statusDiv.textContent = `Error: ${data.message || 'Failed to reset stats'}`;
+                    statusDiv.classList.remove('success');
+                    statusDiv.classList.add('error');
+                }
+                // Hide status after 3 seconds
+                setTimeout(() => {
+                    statusDiv.className = 'attack-status';
+                }, 3000);
+            })
+            .catch(error => {
+                statusDiv.textContent = `Error: ${error.message}`;
+                statusDiv.classList.remove('success');
+                statusDiv.classList.add('error');
+                setTimeout(() => {
+                    statusDiv.className = 'attack-status';
+                }, 3000);
+            });
         }
         
         // Attack generator function
@@ -1674,19 +2379,47 @@ def get_stats():
 
 @app.route('/api/traffic')
 def get_traffic():
-    """Get real-time traffic data from the last 30 seconds only"""
+    """Get real-time traffic data from the last 20 seconds only.
+    Only shows attack traffic if it appears in Recent Alerts (has corresponding alert in database)."""
     current_time = time.time()
-    thirty_seconds_ago = current_time - 30  # Last 30 seconds for real-time view
+    twenty_seconds_ago = current_time - 20  # Last 20 seconds for real-time view
     
-    # Filter traffic buffer to only include data from last 30 seconds
-    recent_traffic = [
-        traffic for traffic in traffic_buffer 
-        if traffic.get('timestamp', 0) >= thirty_seconds_ago
-    ]
+    # Get all alerts from database to cross-reference
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute('''
+        SELECT timestamp, attack_type FROM alerts 
+        WHERE timestamp >= ?
+    ''', (twenty_seconds_ago,))
+    alerts_data = cursor.fetchall()
+    conn.close()
     
-    # Sort by timestamp (oldest first) and limit to latest 30 data points max
+    # Create a set of alert timestamps with ±2 second window for matching
+    # This allows matching traffic that was created slightly before/after the alert
+    alert_timestamps = set()
+    for alert_ts, attack_type in alerts_data:
+        # Allow ±2 second window for matching (traffic might be logged slightly before alert)
+        for offset in range(-2, 3):
+            alert_timestamps.add((int(alert_ts) + offset, attack_type))
+    
+    # Filter traffic buffer to only include data from last 20 seconds
+    recent_traffic = []
+    for traffic in traffic_buffer:
+        traffic_ts = traffic.get('timestamp', 0)
+        if traffic_ts >= twenty_seconds_ago:
+            prediction = traffic.get('prediction', 0)
+            attack_type = traffic.get('attack_type', 'Normal')
+            
+            # Always include normal traffic (prediction == 0)
+            if prediction == 0:
+                recent_traffic.append(traffic)
+            # Only include attack traffic if there's a corresponding alert
+            elif (int(traffic_ts), attack_type) in alert_timestamps:
+                recent_traffic.append(traffic)
+    
+    # Sort by timestamp (oldest first) and limit to latest 20 data points max
     recent_traffic.sort(key=lambda x: x.get('timestamp', 0))
-    recent_traffic = recent_traffic[-30:]  # Keep only last 30 data points
+    recent_traffic = recent_traffic[-20:]  # Keep only last 20 data points
     
     return jsonify(recent_traffic)
 
@@ -1780,6 +2513,41 @@ def trigger_attack():
         })
     except Exception as e:
         logger.error(f"Error triggering attack: {e}")
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+@app.route('/api/reset-stats', methods=['POST'])
+def reset_stats():
+    """API endpoint to reset all dashboard stats by clearing the database"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        
+        # Clear all alerts
+        cursor.execute('DELETE FROM alerts')
+        
+        # Clear all mitigation history
+        cursor.execute('DELETE FROM mitigation_history')
+        
+        # Reset stats table (set total_requests to 0, ensure it exists)
+        cursor.execute('''
+            INSERT OR REPLACE INTO stats (key, value, updated_at) 
+            VALUES ('total_requests', 0, CURRENT_TIMESTAMP)
+        ''')
+        
+        # Clear any other stats if they exist
+        cursor.execute('DELETE FROM stats WHERE key != ?', ('total_requests',))
+        
+        conn.commit()
+        conn.close()
+        
+        logger.info("Dashboard stats reset: All alerts, mitigation history, and stats cleared")
+        
+        return jsonify({
+            'success': True,
+            'message': 'All dashboard stats have been reset successfully'
+        })
+    except Exception as e:
+        logger.error(f"Error resetting stats: {e}")
         return jsonify({'success': False, 'message': str(e)}), 500
 
 if __name__ == '__main__':

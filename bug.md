@@ -60,15 +60,17 @@ All API endpoints returned 500 Internal Server Error.
 - Flask is a **WSGI** (Web Server Gateway Interface) application
 - Uvicorn is an **ASGI** (Asynchronous Server Gateway Interface) server
 - These are incompatible protocols - uvicorn cannot run WSGI applications directly
+- Uvicorn should not be used with Flask applications
 
 ### Solution
-Use the correct server for Flask:
-- **Development**: `python app.py` or `python3 app.py` (uses Flask's built-in WSGI server)
-- **Production**: `gunicorn app:app --bind 0.0.0.0:8888` (uses Gunicorn WSGI server)
+- Removed uvicorn from dependencies (pyproject.toml)
+- Use the correct server for Flask:
+  - **Development**: `python app.py` or `python3 app.py` (uses Flask's built-in WSGI server)
+  - **Production**: `gunicorn app:app --bind 0.0.0.0:8888` (uses Gunicorn WSGI server)
 
 ### Code Changes
-- No code changes needed
-- Use correct command: `python3 app.py` instead of `uvicorn app:app`
+- Removed `uvicorn>=0.38.0` from `pyproject.toml` dependencies
+- No code changes needed - Flask works correctly with WSGI servers
 
 ### Testing
 - Verified Flask app runs correctly with `python3 app.py`
@@ -251,4 +253,134 @@ timestamp,packet_rate,byte_rate,syn_ratio,udp_ratio,dns_queries,connection_rate,
 
 ### Files Modified
 - `app.py`: Added ML logging configuration, `log_ml_prediction()` function, and logging calls in prediction paths
+
+---
+
+## Bug: Traffic Chart Showing Attack Traffic Without Corresponding Alerts
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+The traffic chart was showing attack traffic even when those attacks didn't trigger alerts (false positives that were filtered out). This made the chart inaccurate and confusing, as it showed attacks that weren't actually detected as threats.
+
+### Root Cause
+The `/api/traffic` endpoint was returning all traffic from `traffic_buffer`, including:
+- Normal traffic (prediction == 0) - correct
+- Attack traffic that triggered alerts - correct
+- Attack traffic that was filtered as false positives - **incorrect**
+
+This meant the chart showed attack traffic that never appeared in Recent Alerts.
+
+### Solution Implemented
+Modified `/api/traffic` endpoint to cross-reference traffic data with alerts database:
+- Only show attack traffic (prediction > 0) if there's a corresponding alert in the database
+- Always show normal traffic (prediction == 0)
+- Use ±2 second time window to match traffic timestamps with alert timestamps (accounts for slight timing differences)
+
+### Code Changes
+- Modified `get_traffic()` function in `app.py` (lines 1675-1722)
+- Added database query to fetch alerts from last 30 seconds
+- Added filtering logic to only include attack traffic that has matching alerts
+- Uses timestamp and attack_type matching with ±2 second window
+
+### Result
+- Traffic chart now accurately reflects only attacks that triggered alerts
+- Chart matches what appears in Recent Alerts section
+- False positive attack traffic no longer appears in the chart
+- Normal traffic still displays correctly
+
+### Testing
+- Verified chart only shows attack traffic when corresponding alert exists
+- Verified normal traffic still displays correctly
+- Verified time window matching works correctly
+
+---
+
+## Bug: Excessive False Positive Logging
+
+**Date:** 2025-11-11  
+**Status:** FIXED
+
+### Problem
+Logs were constantly showing false positive filtered messages for attack types that never triggered actual alerts. This created log noise and made it difficult to see relevant information about attacks that actually matter.
+
+Example log spam:
+```
+INFO:__main__:False positive filtered: SYN_Flood (confidence: 1.000, attack_prob: 1.000, ...)
+INFO:__main__:False positive filtered: UDP_Flood (confidence: 0.997, attack_prob: 0.997, ...)
+INFO:__main__:False positive filtered: Slowloris (confidence: 1.000, attack_prob: 1.000, ...)
+```
+
+### Root Cause
+The code was logging every false positive filtered message regardless of whether that attack type had ever triggered an actual alert. This meant attack types that were consistently filtered (never creating alerts) would spam the logs.
+
+### Solution Implemented
+Modified false positive logging to only log when the attack type appears in recent alerts:
+- Added `has_recent_alerts_for_attack_type()` helper function
+- Checks if the attack type has any alerts in the last 60 seconds
+- Only logs false positive filtered messages if that attack type has triggered alerts recently
+- Reduces log noise while preserving useful debugging information
+
+### Code Changes
+- Added `has_recent_alerts_for_attack_type()` function in `app.py` (lines 466-480)
+- Modified false positive logging in `simulate_network_traffic()` (lines 455-459)
+- Only logs false positives for attack types that appear in recent alerts
+
+### Result
+- Logs are much cleaner and less noisy
+- Only see false positive messages for attack types that are actually triggering alerts
+- Easier to debug real issues without log spam
+- Still captures relevant false positive information when needed
+
+### Testing
+- Verified false positive logging only occurs when attack type has recent alerts
+- Verified logs are cleaner when no alerts are present
+- Verified function correctly checks database for recent alerts
+
+---
+
+## Bug: Excessive Werkzeug 400 Bad Request Error Logs
+
+**Date:** 2024-12-19  
+**Status:** FIXED
+
+### Problem
+The application logs were being flooded with werkzeug ERROR messages for 400 Bad Request errors from scanners and bots attempting to probe the server. These malformed requests (often TLS handshake attempts on HTTP port) were creating thousands of log entries like:
+```
+ERROR:werkzeug:104.28.50.130 - - [11/Nov/2025 20:47:05] code 400, message Bad request version ('...')
+```
+
+This made it difficult to see actual application logs and important errors.
+
+### Root Cause
+Werkzeug was logging all 400 Bad Request errors at ERROR level, including:
+- Malformed HTTP requests from scanners
+- TLS handshake attempts on HTTP port
+- Bot probes and automated attacks
+- Invalid request syntax
+
+These are common on public-facing servers and don't represent actual application errors.
+
+### Solution Implemented
+1. **Custom logging filter**: Created `SuppressBadRequestFilter` class to filter out werkzeug 400 errors
+2. **Error handler**: Added Flask error handler for 400 errors to handle them silently
+3. **Logger level**: Set werkzeug logger to ERROR level to reduce verbosity
+
+### Code Changes
+- Added `SuppressBadRequestFilter` class in `app.py` (lines 24-30)
+- Applied filter to werkzeug logger (lines 33-35)
+- Added Flask 400 error handler (lines 69-72)
+- Changed werkzeug log level from WARNING to ERROR
+
+### Result
+- 400 Bad Request errors from scanners/bots are no longer logged
+- Logs are much cleaner and easier to read
+- Actual application errors are still logged
+- Server still responds with 400 status code (just doesn't log it)
+
+### Testing
+- Verified 400 errors are suppressed in logs
+- Verified legitimate errors are still logged
+- Verified server still returns 400 status codes correctly
 

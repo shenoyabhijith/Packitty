@@ -208,7 +208,25 @@ Consider:
                                 ufw_command = f"{ufw_command} (SIMULATED)"
                             else:
                                 ufw_command = f"{ufw_command} (EXECUTED)"
-                            reasoning = f"AI decided to block IP {target_ip}. UFW result: {result.get('message', 'Command executed')}"
+                            
+                            # Enhanced reasoning with attack type and detailed explanation
+                            attack_type = alert.get('attack_type', 'Unknown')
+                            severity = alert.get('severity', 'Unknown')
+                            confidence = alert.get('confidence', 0.0)
+                            # Handle both dict and list formats for features
+                            features = alert.get('features', {})
+                            if isinstance(features, dict):
+                                packet_rate = features.get('packet_rate', 0)
+                            elif isinstance(features, list) and len(features) > 0:
+                                packet_rate = features[0]
+                            else:
+                                packet_rate = 0
+                            
+                            reasoning = f"AI detected {attack_type} attack from {target_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                            reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                            reasoning += f"Decision: Immediate BLOCK action required due to high-severity {attack_type} attack pattern. "
+                            reasoning += f"UFW result: {result.get('message', 'Command executed')}"
+                            
                             tool_executed = True
                             logger.info(f"AI executed BLOCK tool for {target_ip}: {result.get('message')}")
                             
@@ -222,7 +240,25 @@ Consider:
                                 ufw_command = f"{ufw_command} (SIMULATED)"
                             else:
                                 ufw_command = f"{ufw_command} (EXECUTED)"
-                            reasoning = f"AI decided to rate limit IP {target_ip}. UFW result: {result.get('message', 'Command executed')}"
+                            
+                            # Enhanced reasoning with attack type and detailed explanation
+                            attack_type = alert.get('attack_type', 'Unknown')
+                            severity = alert.get('severity', 'Unknown')
+                            confidence = alert.get('confidence', 0.0)
+                            # Handle both dict and list formats for features
+                            features = alert.get('features', {})
+                            if isinstance(features, dict):
+                                packet_rate = features.get('packet_rate', 0)
+                            elif isinstance(features, list) and len(features) > 0:
+                                packet_rate = features[0]
+                            else:
+                                packet_rate = 0
+                            
+                            reasoning = f"AI detected {attack_type} attack from {target_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                            reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                            reasoning += f"Decision: RATE_LIMIT action applied to throttle {attack_type} attack while preserving legitimate connections. "
+                            reasoning += f"UFW result: {result.get('message', 'Command executed')}"
+                            
                             tool_executed = True
                             logger.info(f"AI executed RATE_LIMIT tool for {target_ip}: {result.get('message')}")
                     except Exception as e:
@@ -233,6 +269,20 @@ Consider:
             if not tool_executed:
                 ai_response = message.content.strip() if hasattr(message, 'content') and message.content else ""
                 
+                # Get attack details for enhanced reasoning
+                attack_type = alert.get('attack_type', 'Unknown')
+                severity = alert.get('severity', 'Unknown')
+                confidence = alert.get('confidence', 0.0)
+                source_ip = alert.get('source_ip', 'Unknown')
+                # Handle both dict and list formats for features
+                features = alert.get('features', {})
+                if isinstance(features, dict):
+                    packet_rate = features.get('packet_rate', 0)
+                elif isinstance(features, list) and len(features) > 0:
+                    packet_rate = features[0]
+                else:
+                    packet_rate = 0
+                
                 # Try to extract JSON from response
                 try:
                     import re
@@ -241,17 +291,29 @@ Consider:
                         if json_match:
                             result = json.loads(json_match.group())
                             action = result.get('action', 'MONITOR')
-                            reasoning = result.get('reasoning', 'AI analysis completed')
+                            base_reasoning = result.get('reasoning', 'AI analysis completed')
+                            # Enhance with attack type details
+                            reasoning = f"AI detected {attack_type} attack from {source_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                            reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                            reasoning += f"Decision: {base_reasoning}"
                         else:
                             # Parse text response
                             result = self._parse_text_response(ai_response)
                             action = result['action']
-                            reasoning = result['reasoning']
+                            base_reasoning = result['reasoning']
+                            # Enhance with attack type details
+                            reasoning = f"AI detected {attack_type} attack from {source_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                            reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                            reasoning += f"Decision: {base_reasoning}"
                     else:
-                        reasoning = "AI analyzed but recommended monitoring"
+                        reasoning = f"AI detected {attack_type} attack from {source_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                        reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                        reasoning += "Decision: Monitoring recommended - threat level not sufficient for immediate action."
                 except Exception as e:
                     logger.error(f"Error parsing AI response: {e}")
-                    reasoning = ai_response if ai_response else "AI analyzed but recommended monitoring"
+                    reasoning = f"AI detected {attack_type} attack from {source_ip} (Severity: {severity}, Confidence: {confidence:.1%}). "
+                    reasoning += f"Attack characteristics: {packet_rate:.0f} packets/sec. "
+                    reasoning += f"Decision: {ai_response if ai_response else 'Monitoring recommended - threat level not sufficient for immediate action.'}"
             
             recommendation = {
                 'action': action,
